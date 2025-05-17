@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -18,6 +19,16 @@ func TestSupervisorIntegration(t *testing.T) {
 	// Set up test environment
 	os.Setenv("CONTROLLER_TOKEN", "test-token")
 	defer os.Unsetenv("CONTROLLER_TOKEN")
+
+	// Create test directories in ./tmp/
+	scenarios := []string{"no_db", "existing_db", "replication"}
+	for _, scenario := range scenarios {
+		dir := filepath.Join("tmp", scenario)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to create test directory %s: %v", dir, err)
+		}
+		defer os.RemoveAll(dir)
+	}
 
 	// Start a Go HTTP server as the upstream
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,10 +84,11 @@ func TestSupervisorIntegration(t *testing.T) {
 	// Test 3: Configure object storage
 	t.Run("Configure object storage", func(t *testing.T) {
 		config := lib.ObjectStorageConfig{
-			Bucket:    "test-bucket",
-			Endpoint:  "http://localhost:9000",
-			AccessKey: "test-key",
-			SecretKey: "test-secret",
+			Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
+			Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
+			AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
+			SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
+			Region:    os.Getenv("FLY_TIGRIS_REGION"),
 		}
 		configJSON, _ := json.Marshal(config)
 

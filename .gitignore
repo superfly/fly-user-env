@@ -1,1 +1,5 @@
 reference/*
+!reference/.gitkeep
+data/*
+!data/.gitkeep
+.envrc
