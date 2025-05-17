@@ -1,0 +1,11 @@
+---
+description: Development of mcp capabilities
+globs: 
+alwaysApply: false
+---
+
+# mcp
+
+- ALL mcp functionality should be implemented as HTTP calls through the webserver
+- The <binary> mcp command runs a local stdio server, its job is just to connect to the webserver and relay information back and forth
+- NEVER make the mcp server implement logic directly

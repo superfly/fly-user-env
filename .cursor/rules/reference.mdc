@@ -1,0 +1,6 @@
+---
+description: 
+globs: reference/**/*
+alwaysApply: false
+---
+Files in the reference directory are for reading and reference only. Never make changes to them, or include them in other work.
