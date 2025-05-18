@@ -92,13 +92,7 @@ func RunSupervisor() (error, *Cleanup) {
 	}
 
 	supervisor := lib.NewSupervisor(args)
-	admin := lib.NewAdmin(supervisor, token)
-
-	// Add admin cleanup to our cleanup tasks
-	cleanup.Add(func() error {
-		admin.WaitForLockCleanup()
-		return nil
-	})
+	admin := lib.NewAdmin(*targetAddr, token, supervisor)
 
 	proxy, err := lib.New(*targetAddr, supervisor)
 	if err != nil {

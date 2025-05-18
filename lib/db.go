@@ -25,8 +25,12 @@ type DBManager struct {
 
 // NewDBManager creates a new database manager instance
 func NewDBManager(config *ObjectStorageConfig) *DBManager {
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = filepath.Join("data", "db", "app.sqlite")
+	}
 	return &DBManager{
-		DBPath: filepath.Join("data", "db", "app.sqlite"),
+		DBPath: dbPath,
 		config: config,
 	}
 }
@@ -89,6 +93,7 @@ func (dm *DBManager) Initialize() error {
 func (dm *DBManager) litestreamDB() *litestream.DB {
 	lsdb := litestream.NewDB(dm.DBPath)
 
+	// Configure S3 replica client
 	client := lss3.NewReplicaClient()
 	client.Bucket = dm.config.Bucket
 	client.Endpoint = dm.config.Endpoint

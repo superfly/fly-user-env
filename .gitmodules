@@ -1,0 +1,4 @@
+[submodule "litestream"]
+	path = litestream
+	url = https://github.com/benbjohnson/litestream.git
+	branch = s3-lease

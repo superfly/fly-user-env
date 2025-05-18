@@ -1,1 +1,3 @@
-scripts/run-container.sh 
+scripts/run-container.sh
+.git
+vendor/litestream/.git 

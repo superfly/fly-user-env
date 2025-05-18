@@ -8,6 +8,7 @@ import (
 func TestSupervisor(t *testing.T) {
 	// Use a long-running command
 	s := NewSupervisor([]string{"tail", "-f", "/dev/null"})
+	defer s.StopProcess() // Ensure process is stopped after test
 
 	// Test initial state
 	if s.IsRunning() {
@@ -40,6 +41,7 @@ func TestSupervisor(t *testing.T) {
 func TestSupervisorRestart(t *testing.T) {
 	// Use a long-running command
 	s := NewSupervisor([]string{"tail", "-f", "/dev/null"})
+	defer s.StopProcess() // Ensure process is stopped after test
 
 	// Start process
 	if err := s.StartProcess(); err != nil {

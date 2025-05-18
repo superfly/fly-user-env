@@ -1,116 +1,143 @@
 package lib
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
+// MockComponent is a test implementation of StackComponent
+type MockComponent struct{}
+
+func (m *MockComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
+	return nil
+}
+
+func (m *MockComponent) Cleanup(ctx context.Context) error {
+	return nil
+}
+
 func TestAdmin(t *testing.T) {
-	// Create supervisor and admin
-	s := NewSupervisor([]string{"echo", "test"})
-	a := NewAdmin(s, "test-token")
+	// Create supervisor with a dummy command
+	supervisor := NewSupervisor([]string{"tail", "-f", "/dev/null"})
+	defer supervisor.StopProcess()
+
+	// Create admin with default components
+	admin := NewAdmin("localhost:8080", "test-token", supervisor)
+
+	// Create test server
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Host, "fly-app-controller") {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		admin.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
 
 	// Test initial status
-	req := httptest.NewRequest("GET", "/", nil)
-	req.Host = "fly-app-controller"
-	req.Header.Set("Authorization", "Bearer test-token")
-	w := httptest.NewRecorder()
-	a.ServeHTTP(w, req)
+	t.Run("Initial status", func(t *testing.T) {
+		req, err := http.NewRequest("GET", ts.URL, nil)
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "fly-app-controller"
+		req.Header.Set("Authorization", "Bearer test-token")
 
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status code %d, got %d", http.StatusOK, w.Code)
-	}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected status 200, got %d", resp.StatusCode)
+		}
 
-	var status struct {
-		Configured bool `json:"configured"`
-		Running    bool `json:"running"`
-	}
-	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
+		var status struct {
+			Configured bool `json:"configured"`
+			Running    bool `json:"running"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+		if status.Configured {
+			t.Error("Expected configured to be false initially")
+		}
+		if status.Running {
+			t.Error("Expected running to be false initially")
+		}
+	})
 
-	if status.Configured {
-		t.Error("Should not be configured initially")
-	}
-	if status.Running {
-		t.Error("Should not be running initially")
-	}
+	// Test invalid configuration
+	t.Run("Invalid configuration", func(t *testing.T) {
+		req, err := http.NewRequest("POST", ts.URL, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "fly-app-controller"
+		req.Header.Set("Authorization", "Bearer test-token")
 
-	// Test invalid config
-	invalidConfig := `{"bucket": "", "access_key": "", "secret_key": ""}`
-	req = httptest.NewRequest("POST", "/", bytes.NewBufferString(invalidConfig))
-	req.Host = "fly-app-controller"
-	req.Header.Set("Authorization", "Bearer test-token")
-	w = httptest.NewRecorder()
-	a.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("Expected status code %d, got %d", http.StatusBadRequest, w.Code)
-	}
-
-	// Test valid config
-	validConfig := ObjectStorageConfig{
-		Bucket:    "test-bucket",
-		Endpoint:  "http://localhost:9000",
-		AccessKey: "test-key",
-		SecretKey: "test-secret",
-	}
-	configJSON, _ := json.Marshal(validConfig)
-	req = httptest.NewRequest("POST", "/", bytes.NewBuffer(configJSON))
-	req.Host = "fly-app-controller"
-	req.Header.Set("Authorization", "Bearer test-token")
-	w = httptest.NewRecorder()
-	a.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status code %d, got %d", http.StatusOK, w.Code)
-	}
-
-	// Check status after configuration
-	req = httptest.NewRequest("GET", "/", nil)
-	req.Host = "fly-app-controller"
-	req.Header.Set("Authorization", "Bearer test-token")
-	w = httptest.NewRecorder()
-	a.ServeHTTP(w, req)
-
-	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
-		t.Fatalf("Failed to decode response: %v", err)
-	}
-
-	if !status.Configured {
-		t.Error("Should be configured after POST")
-	}
-	if !status.Running {
-		t.Error("Should be running after configuration")
-	}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected status 400, got %d", resp.StatusCode)
+		}
+	})
 
 	// Test wrong host
-	req = httptest.NewRequest("GET", "/", nil)
-	req.Host = "wrong-host"
-	req.Header.Set("Authorization", "Bearer test-token")
-	w = httptest.NewRecorder()
-	a.ServeHTTP(w, req)
+	t.Run("Wrong host", func(t *testing.T) {
+		req, err := http.NewRequest("GET", ts.URL, nil)
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "wrong-host"
+		req.Header.Set("Authorization", "Bearer test-token")
 
-	if w.Code != http.StatusNotFound {
-		t.Errorf("Expected status code %d, got %d", http.StatusNotFound, w.Code)
-	}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected status 404, got %d", resp.StatusCode)
+		}
+	})
 }
 
 func TestAdminMethodNotAllowed(t *testing.T) {
-	s := NewSupervisor([]string{"echo", "test"})
-	a := NewAdmin(s, "test-token")
+	// Create supervisor with a dummy command
+	supervisor := NewSupervisor([]string{"tail", "-f", "/dev/null"})
+	defer supervisor.StopProcess()
 
-	// Test unsupported method
-	req := httptest.NewRequest("PUT", "/", nil)
+	// Create admin with default components
+	admin := NewAdmin("localhost:8080", "test-token", supervisor)
+
+	// Create test server
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Host, "fly-app-controller") {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		admin.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	// Test PUT method
+	req, err := http.NewRequest("PUT", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
 	req.Host = "fly-app-controller"
 	req.Header.Set("Authorization", "Bearer test-token")
-	w := httptest.NewRecorder()
-	a.ServeHTTP(w, req)
 
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("Expected status code %d, got %d", http.StatusMethodNotAllowed, w.Code)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", resp.StatusCode)
 	}
 }

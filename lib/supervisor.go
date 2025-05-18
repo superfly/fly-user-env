@@ -4,12 +4,13 @@
 package lib
 
 import (
+	"bufio"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -21,6 +22,7 @@ type Supervisor struct {
 		sync.RWMutex
 		running bool
 		cmd     *exec.Cmd
+		pid     int
 	}
 }
 
@@ -38,7 +40,20 @@ func NewSupervisor(command []string) *Supervisor {
 func (s *Supervisor) IsRunning() bool {
 	s.process.RLock()
 	defer s.process.RUnlock()
-	return s.process.running
+
+	if !s.process.running || s.process.pid == 0 {
+		return false
+	}
+
+	// Check if process exists by sending signal 0
+	// This doesn't actually send a signal, just checks if process exists
+	process, err := os.FindProcess(s.process.pid)
+	if err != nil {
+		return false
+	}
+
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
 }
 
 // StartProcess starts the supervised process and sets up output handling.
@@ -72,10 +87,16 @@ func (s *Supervisor) StartProcess() error {
 	}
 
 	go func() {
-		io.Copy(os.Stdout, stdout)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			log.Printf("[PROCESS STDOUT] %s", scanner.Text())
+		}
 	}()
 	go func() {
-		io.Copy(os.Stderr, stderr)
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			log.Printf("[PROCESS STDERR] %s", scanner.Text())
+		}
 	}()
 
 	go func() {
@@ -83,6 +104,7 @@ func (s *Supervisor) StartProcess() error {
 		s.process.Lock()
 		s.process.running = false
 		s.process.cmd = nil
+		s.process.pid = 0
 		s.process.Unlock()
 		if err != nil {
 			log.Printf("Process exited with error: %v", err)
@@ -97,6 +119,8 @@ func (s *Supervisor) StartProcess() error {
 
 	s.process.running = true
 	s.process.cmd = cmd
+	s.process.pid = cmd.Process.Pid
+	log.Printf("Started process with PID %d: %v", s.process.pid, s.command)
 	return nil
 }
 
@@ -120,5 +144,6 @@ func (s *Supervisor) StopProcess() error {
 
 	s.process.running = false
 	s.process.cmd = nil
+	s.process.pid = 0
 	return nil
 }

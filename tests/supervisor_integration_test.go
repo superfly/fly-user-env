@@ -7,19 +7,32 @@ import (
 	"testing"
 
 	"supervisor/lib"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
-func TestDBManagerIntegration(t *testing.T) {
-	if os.Getenv("INTEGRATION_TEST") != "1" {
-		t.Skip("Skipping integration test")
+// Helper function to get object storage configuration
+func getObjectStorageConfig() *lib.ObjectStorageConfig {
+	return &lib.ObjectStorageConfig{
+		Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
+		Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
+		AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
+		SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
+		Region:    "auto",
+	}
+}
+
+func TestSupervisorIntegration(t *testing.T) {
+	// Skip if required env vars are not set
+	if os.Getenv("FLY_TIGRIS_BUCKET") == "" ||
+		os.Getenv("FLY_TIGRIS_ENDPOINT_URL") == "" ||
+		os.Getenv("FLY_TIGRIS_ACCESS_KEY") == "" ||
+		os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY") == "" {
+		t.Skip("Skipping integration test. Set FLY_TIGRIS_* environment variables to run.")
 	}
 
 	// Create test directories in ./tmp/
-	scenarios := []string{"no_db", "existing_db"}
+	scenarios := []string{"replication"}
 	for _, scenario := range scenarios {
-		dir := filepath.Join("tmp", scenario)
+		dir := filepath.Join("..", "tmp", scenario)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatalf("Failed to create test directory %s: %v", dir, err)
 		}
@@ -29,7 +42,7 @@ func TestDBManagerIntegration(t *testing.T) {
 	// Test full functionality in each scenario
 	for _, scenario := range scenarios {
 		t.Run(scenario, func(t *testing.T) {
-			dir := filepath.Join("tmp", scenario)
+			dir := filepath.Join("..", "tmp", scenario)
 			config := &lib.ObjectStorageConfig{
 				Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
 				Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),

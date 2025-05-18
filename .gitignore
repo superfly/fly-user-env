@@ -3,3 +3,5 @@ reference/*
 data/*
 !data/.gitkeep
 .envrc
+tmp/
+!tmp/.gitkeep
