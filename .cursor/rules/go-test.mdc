@@ -1,7 +1,7 @@
 ---
-description: Testing Golang apps
+description: 
 globs: 
-alwaysApply: false
+alwaysApply: true
 ---
 # Go Testing Rules
 
@@ -9,3 +9,7 @@ alwaysApply: false
 - Tests MUST fail if the code they're testing isn't implemented
 - NEVER modify tests to make them pass without implementing the required functionality
 - Write tests before implementing features (TDD approach)
+- NEVER mock API calls
+- ALWAYS use integration tests in ./tests/ to run tests against the real live APIs
+- ALWAYS use env vars for external service config from tests, always send those to the Admin controller without printing them
+- NEVER change auth, credentials, env to try and make tests pass

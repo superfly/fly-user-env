@@ -107,7 +107,6 @@ func (dm *DBManager) litestreamDB() *litestream.DB {
 }
 
 // Comment out failing Litestream tests for now
-/*
 func (dm *DBManager) Restore() error {
 	ctx := context.Background()
 	lsdb := dm.litestreamDB()
@@ -150,7 +149,6 @@ func (dm *DBManager) StartReplication() error {
 	log.Printf("Started Litestream replication")
 	return nil
 }
-*/
 
 func (dm *DBManager) StopReplication() error {
 	log.Printf("StopReplication is not implemented yet")

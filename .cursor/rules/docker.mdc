@@ -1,0 +1,7 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+- ALWAYS run ./scripts/run-container.sh when trying to start a container
+- ALWAYS ask user for permission to run `docker` commands directly

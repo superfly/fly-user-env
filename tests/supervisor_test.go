@@ -11,11 +11,28 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"supervisor/lib"
 )
 
+// Helper function to get object storage configuration
+func getObjectStorageConfig() *lib.ObjectStorageConfig {
+	return &lib.ObjectStorageConfig{
+		Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
+		Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
+		AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
+		SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
+		Region:    "auto",
+	}
+}
+
 func TestSupervisorIntegration(t *testing.T) {
+	// Skip if not running integration tests
+	if os.Getenv("INTEGRATION_TEST") != "1" {
+		t.Skip("Skipping integration test. Set INTEGRATION_TEST=1 to run.")
+	}
+
 	// Set up test environment
 	os.Setenv("CONTROLLER_TOKEN", "test-token")
 	defer os.Unsetenv("CONTROLLER_TOKEN")
@@ -46,7 +63,11 @@ func TestSupervisorIntegration(t *testing.T) {
 
 	// Create supervisor with a dummy command (simulate process management)
 	supervisor := lib.NewSupervisor([]string{"tail", "-f", "/dev/null"})
-	admin := lib.NewAdmin(supervisor, "test-token")
+	admin := lib.NewAdmin(upstreamAddr, "test-token")
+
+	// Set shorter timeouts for testing
+	admin.SetLockTimeouts(10*time.Second, 10*time.Second)
+
 	proxy, err := lib.New(upstreamAddr, supervisor)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
@@ -83,13 +104,7 @@ func TestSupervisorIntegration(t *testing.T) {
 
 	// Test 3: Configure object storage
 	t.Run("Configure object storage", func(t *testing.T) {
-		config := lib.ObjectStorageConfig{
-			Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
-			Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
-			AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
-			SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
-			Region:    os.Getenv("FLY_TIGRIS_REGION"),
-		}
+		config := getObjectStorageConfig()
 		configJSON, _ := json.Marshal(config)
 
 		req, err := http.NewRequest("POST", ts.URL, bytes.NewBuffer(configJSON))

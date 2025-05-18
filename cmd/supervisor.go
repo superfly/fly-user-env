@@ -9,9 +9,52 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"supervisor/lib"
 )
+
+// Cleanup represents a cleanup operation that can be deferred
+type Cleanup struct {
+	mu     sync.Mutex
+	tasks  []func() error
+	done   bool
+	errors []error
+}
+
+// Add adds a cleanup task to be executed
+func (c *Cleanup) Add(task func() error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.tasks = append(c.tasks, task)
+	}
+}
+
+// Execute runs all cleanup tasks in reverse order
+func (c *Cleanup) Execute() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done {
+		return
+	}
+	c.done = true
+
+	// Execute tasks in reverse order (LIFO)
+	for i := len(c.tasks) - 1; i >= 0; i-- {
+		if err := c.tasks[i](); err != nil {
+			c.errors = append(c.errors, err)
+			log.Printf("Cleanup task failed: %v", err)
+		}
+	}
+}
+
+// Errors returns any errors that occurred during cleanup
+func (c *Cleanup) Errors() []error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.errors
+}
 
 // RunSupervisor starts the supervisor service with the following responsibilities:
 // - Manages a long-running process specified by command-line arguments
@@ -26,32 +69,40 @@ import (
 // Required environment variables:
 //   - CONTROLLER_TOKEN: Token for admin interface access
 //
-// Returns an error if the service fails to start.
-func RunSupervisor() error {
+// Returns an error if the service fails to start, and a cleanup function that should be called on shutdown.
+func RunSupervisor() (error, *Cleanup) {
+	cleanup := &Cleanup{}
+
 	listenAddr := flag.String("listen", "0.0.0.0:8080", "Address to listen on")
 	targetAddr := flag.String("target", "", "Address to proxy to")
 	flag.Parse()
 
 	if *targetAddr == "" {
-		return fmt.Errorf("--target flag is required")
+		return fmt.Errorf("--target flag is required"), cleanup
 	}
 
 	args := flag.Args()
 	if len(args) == 0 {
-		return fmt.Errorf("command to supervise is required")
+		return fmt.Errorf("command to supervise is required"), cleanup
 	}
 
 	token := os.Getenv("CONTROLLER_TOKEN")
 	if token == "" {
-		return fmt.Errorf("CONTROLLER_TOKEN environment variable is required for controller access")
+		return fmt.Errorf("CONTROLLER_TOKEN environment variable is required for controller access"), cleanup
 	}
 
 	supervisor := lib.NewSupervisor(args)
 	admin := lib.NewAdmin(supervisor, token)
 
+	// Add admin cleanup to our cleanup tasks
+	cleanup.Add(func() error {
+		admin.WaitForLockCleanup()
+		return nil
+	})
+
 	proxy, err := lib.New(*targetAddr, supervisor)
 	if err != nil {
-		return fmt.Errorf("failed to create proxy: %v", err)
+		return fmt.Errorf("failed to create proxy: %v", err), cleanup
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,6 +119,24 @@ func RunSupervisor() error {
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
 
+	server := &http.Server{
+		Addr:    *listenAddr,
+		Handler: mux,
+	}
+
+	// Add server shutdown to cleanup
+	cleanup.Add(func() error {
+		return server.Close()
+	})
+
 	log.Printf("Starting supervisor on %s, proxying to %s", *listenAddr, *targetAddr)
-	return http.ListenAndServe(*listenAddr, mux)
+
+	// Start server in a goroutine
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	return nil, cleanup
 }
