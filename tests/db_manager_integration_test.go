@@ -53,8 +53,13 @@ func TestDBManagerIntegration(t *testing.T) {
 			}
 
 			// Verify database file exists
+			if _, err := os.Stat(dm.ActiveDBPath); os.IsNotExist(err) {
+				t.Errorf("Database file does not exist at %s", dm.ActiveDBPath)
+			}
+
+			// Verify symlink exists and points to the database file
 			if _, err := os.Stat(dm.DBPath); os.IsNotExist(err) {
-				t.Fatalf("Database file was not created at %s", dm.DBPath)
+				t.Errorf("Database symlink does not exist at %s", dm.DBPath)
 			}
 
 			// Test basic SQLite operations

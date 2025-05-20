@@ -99,7 +99,7 @@ func RunSupervisor() (error, *Cleanup, *lib.Supervisor) {
 		RestartDelay: config.RestartDelay,
 	})
 	// Create control instance
-	control := lib.NewControl("localhost:8080", "test-token", "tmp", supervisor)
+	control := lib.NewControl("localhost:8080", "test-token", "test-token", "tmp", supervisor)
 
 	proxy, err := lib.New(*targetAddr, supervisor)
 	if err != nil {

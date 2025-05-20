@@ -11,7 +11,7 @@ import (
 
 // LeaserComponent implements StackComponent for S3 lease management
 type LeaserComponent struct {
-	leaser *lss3.Leaser
+	Leaser *lss3.Leaser
 	owner  string
 }
 
@@ -37,26 +37,26 @@ func (l *LeaserComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) e
 		return fmt.Errorf("failed to open leaser: %w", err)
 	}
 
-	l.leaser = leaser
+	l.Leaser = leaser
 	return nil
 }
 
 func (l *LeaserComponent) Cleanup(ctx context.Context) error {
-	if l.leaser != nil {
+	if l.Leaser != nil {
 		// Get all epochs to find active leases
-		epochs, err := l.leaser.Epochs(ctx)
+		epochs, err := l.Leaser.Epochs(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to list epochs: %w", err)
 		}
 
 		// Release each lease
 		for _, epoch := range epochs {
-			if err := l.leaser.ReleaseLease(ctx, epoch); err != nil {
+			if err := l.Leaser.ReleaseLease(ctx, epoch); err != nil {
 				return fmt.Errorf("failed to release lease %d: %w", epoch, err)
 			}
 		}
 
-		l.leaser = nil
+		l.Leaser = nil
 	}
 	return nil
 }

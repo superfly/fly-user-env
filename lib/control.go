@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/benbjohnson/litestream"
 	lss3 "github.com/benbjohnson/litestream/s3"
 	// For types.NoSuchKey
 )
@@ -23,7 +24,16 @@ type StackComponent interface {
 	Cleanup(ctx context.Context) error
 }
 
-// DBManagerComponent implements StackComponent for SQLite database management
+// CheckpointableComponent represents a component that supports checkpoint and restore operations
+type CheckpointableComponent interface {
+	StackComponent
+	// CreateCheckpoint creates a checkpoint with the given ID and returns a checkpoint identifier
+	CreateCheckpoint(ctx context.Context, id string) (string, error)
+	// RestoreToCheckpoint restores the component to the state at the given checkpoint ID
+	RestoreToCheckpoint(ctx context.Context, id string) error
+}
+
+// DBManagerComponent implements StackComponent and CheckpointableComponent
 type DBManagerComponent struct {
 	dbManager *DBManager
 	dataDir   string
@@ -34,7 +44,9 @@ func NewDBManagerComponent(dataDir string) *DBManagerComponent {
 }
 
 func (d *DBManagerComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
+	log.Printf("DBManagerComponent.Setup: dataDir=%s", d.dataDir)
 	d.dbManager = NewDBManager(cfg, d.dataDir)
+	log.Printf("DBManagerComponent.Setup: ActiveDBPath=%s", d.dbManager.ActiveDBPath)
 	if err := d.dbManager.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
@@ -48,6 +60,84 @@ func (d *DBManagerComponent) Cleanup(ctx context.Context) error {
 	if d.dbManager != nil {
 		return d.dbManager.StopReplication()
 	}
+	return nil
+}
+
+// CreateCheckpoint creates a checkpoint of the database state and returns a checkpoint identifier
+func (d *DBManagerComponent) CreateCheckpoint(ctx context.Context, id string) (string, error) {
+	if d.dbManager == nil {
+		return "", fmt.Errorf("database manager not initialized")
+	}
+
+	// Get current position from the database
+	lsdb := d.dbManager.litestreamDB()
+	pos, err := lsdb.Pos()
+	if err != nil {
+		return "", fmt.Errorf("failed to get database position: %w", err)
+	}
+
+	// Create checkpoint identifier that includes:
+	// - The provided ID
+	// - The Litestream position (generation, index, offset)
+	// - Timestamp
+	checkpointID := fmt.Sprintf("%s-%s-%d-%d-%d",
+		id,
+		pos.Generation,
+		pos.Index,
+		pos.Offset,
+		time.Now().UnixNano())
+
+	return checkpointID, nil
+}
+
+// RestoreToCheckpoint restores the database to the state at the given checkpoint ID.
+// If id is empty, it restores to the latest state.
+func (d *DBManagerComponent) RestoreToCheckpoint(ctx context.Context, id string) error {
+	if d.dbManager == nil {
+		return fmt.Errorf("database manager not initialized")
+	}
+
+	// Stop replication before restore
+	if err := d.dbManager.StopReplication(); err != nil {
+		return fmt.Errorf("failed to stop replication: %w", err)
+	}
+
+	// Get the replica and restore options
+	lsdb := d.dbManager.litestreamDB()
+	if len(lsdb.Replicas) == 0 {
+		return fmt.Errorf("no replicas configured")
+	}
+	replica := lsdb.Replicas[0]
+
+	// Create restore options
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = d.dbManager.ActiveDBPath
+
+	if id == "" {
+		// For latest state, let Litestream calculate the restore target
+		var err error
+		if opt.Generation, _, err = replica.CalcRestoreTarget(ctx, opt); err != nil {
+			return fmt.Errorf("failed to calculate restore target: %w", err)
+		}
+	} else {
+		// For now, just restore to latest state for the given ID
+		// In the future, we'll use the checkpoint identifier to restore to the exact point
+		var err error
+		if opt.Generation, _, err = replica.CalcRestoreTarget(ctx, opt); err != nil {
+			return fmt.Errorf("failed to calculate restore target: %w", err)
+		}
+	}
+
+	// Restore the database
+	if err := replica.Restore(ctx, opt); err != nil {
+		return fmt.Errorf("failed to restore database: %w", err)
+	}
+
+	// Restart replication
+	if err := d.dbManager.StartReplication(); err != nil {
+		return fmt.Errorf("failed to restart replication: %w", err)
+	}
+
 	return nil
 }
 
@@ -123,15 +213,16 @@ type Control struct {
 }
 
 // NewControl creates a new control instance
-func NewControl(targetAddr, controllerAddr, dataDir string, supervisor *Supervisor, components ...StackComponent) *Control {
-	return NewControlWithConfig(targetAddr, controllerAddr, supervisor, filepath.Join(dataDir, "config.json"), dataDir, components...)
+func NewControl(targetAddr, controllerAddr, token, dataDir string, supervisor *Supervisor, components ...StackComponent) *Control {
+	return NewControlWithConfig(targetAddr, controllerAddr, token, supervisor, filepath.Join(dataDir, "config.json"), dataDir, components...)
 }
 
 // NewControlWithConfig creates a new control instance with a custom config path
-func NewControlWithConfig(targetAddr, controllerAddr string, supervisor *Supervisor, configPath, dataDir string, components ...StackComponent) *Control {
+func NewControlWithConfig(targetAddr, controllerAddr, token string, supervisor *Supervisor, configPath, dataDir string, components ...StackComponent) *Control {
 	c := &Control{
 		targetAddr:     targetAddr,
 		controllerAddr: controllerAddr,
+		token:          token,
 		configPath:     configPath,
 		dataDir:        dataDir,
 		supervisor:     supervisor,
@@ -146,6 +237,14 @@ func NewControlWithConfig(targetAddr, controllerAddr string, supervisor *Supervi
 	return c
 }
 
+// getAvailableComponents returns a map of available components by name
+func (c *Control) getAvailableComponents() map[string]StackComponent {
+	return map[string]StackComponent{
+		"leaser": NewLeaserComponent(),
+		"db":     NewDBManagerComponent(c.dataDir),
+	}
+}
+
 func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error {
 	// If no stacks specified, use all components
 	if len(cfg.Stacks) == 0 {
@@ -157,20 +256,15 @@ func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error 
 		return nil
 	}
 
-	// Map of available components by name
-	availableComponents := map[string]StackComponent{
-		"leaser": NewLeaserComponent(),
-		"db":     NewDBManagerComponent(c.dataDir),
-	}
-
 	// Set up only the specified components
 	for _, stackName := range cfg.Stacks {
-		component, ok := availableComponents[stackName]
+		component, ok := c.getAvailableComponents()[stackName]
 		if !ok {
 			return fmt.Errorf("unknown stack component: %s", stackName)
 		}
+		log.Printf("Setting up component %s with dataDir: %s", stackName, c.dataDir)
 		if err := component.Setup(ctx, &cfg.Storage); err != nil {
-			return fmt.Errorf("failed to setup component %s: %w", stackName, err)
+			return fmt.Errorf("failed to setup component: %w", err)
 		}
 	}
 
@@ -238,7 +332,7 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth := r.Header.Get("Authorization")
-	expected := "Bearer " + c.controllerAddr
+	expected := "Bearer " + c.token
 	if auth != expected {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -246,9 +340,12 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
-		if r.URL.Path == "/release-lease" {
+		switch r.URL.Path {
+		case "/release-lease":
 			c.handleReleaseLease(w, r)
-		} else {
+		case "/checkpoint":
+			c.handleCheckpoint(w, r)
+		default:
 			c.handleConfig(w, r)
 		}
 	case http.MethodGet:
@@ -283,7 +380,7 @@ func (c *Control) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 	// Set up components
 	if err := c.setupComponents(r.Context(), &cfgData); err != nil {
-		http.Error(w, "Failed to set up components", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to set up components: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -382,4 +479,66 @@ func (c *Control) configureS3Leaser(ctx context.Context, config *ObjectStorageCo
 	}
 
 	return nil
+}
+
+// handleCheckpoint creates checkpoints for all checkpointable components and returns their status
+func (c *Control) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.config == nil {
+		http.Error(w, "Not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Generate a unique checkpoint ID
+	checkpointID := fmt.Sprintf("checkpoint-%d", time.Now().UnixNano())
+
+	// Create a response structure
+	type ComponentCheckpoint struct {
+		ID string `json:"id"`
+	}
+
+	type CheckpointResponse struct {
+		Config struct {
+			Storage struct {
+				Bucket    string `json:"bucket"`
+				Endpoint  string `json:"endpoint"`
+				Region    string `json:"region"`
+				KeyPrefix string `json:"key_prefix"`
+			} `json:"storage"`
+			Stacks []string `json:"stacks"`
+		} `json:"config"`
+		Checkpoints map[string]ComponentCheckpoint `json:"checkpoints"`
+	}
+
+	response := CheckpointResponse{
+		Checkpoints: make(map[string]ComponentCheckpoint),
+	}
+
+	// Copy config without sensitive data
+	response.Config.Storage.Bucket = c.config.Storage.Bucket
+	response.Config.Storage.Endpoint = c.config.Storage.Endpoint
+	response.Config.Storage.Region = c.config.Storage.Region
+	response.Config.Storage.KeyPrefix = c.config.Storage.KeyPrefix
+	response.Config.Stacks = c.config.Stacks
+
+	// Create checkpoints for all checkpointable components
+	for stackName, component := range c.getAvailableComponents() {
+		if checkpointable, ok := component.(CheckpointableComponent); ok {
+			// Create checkpoint
+			componentCheckpointID, err := checkpointable.CreateCheckpoint(r.Context(), checkpointID)
+			if err != nil {
+				http.Error(w, "Failed to create checkpoint", http.StatusInternalServerError)
+				return
+			}
+			response.Checkpoints[stackName] = ComponentCheckpoint{
+				ID: componentCheckpointID,
+			}
+		}
+	}
+
+	// Send response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

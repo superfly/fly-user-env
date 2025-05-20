@@ -32,7 +32,7 @@ func TestControl(t *testing.T) {
 	defer supervisor.StopProcess()
 
 	// Create control with default components
-	control := NewControl("localhost:8080", "test-token", tmpDir, supervisor)
+	control := NewControl("localhost:8080", "test-token", "test-token", tmpDir, supervisor)
 
 	// Create test server
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,7 +84,7 @@ func TestControlMethodNotAllowed(t *testing.T) {
 	defer supervisor.StopProcess()
 
 	// Create control with default components
-	control := NewControl("localhost:8080", "test-token", tmpDir, supervisor)
+	control := NewControl("localhost:8080", "test-token", "test-token", tmpDir, supervisor)
 
 	// Create test server
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

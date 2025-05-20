@@ -19,7 +19,7 @@ func main() {
 	}
 
 	// Create control with default components
-	control := lib.NewControl("localhost:8080", "test-token", "tmp", supervisor)
+	control := lib.NewControl("localhost:8080", "test-token", "test-token", "tmp", supervisor)
 
 	// Create HTTP server
 	mux := http.NewServeMux()

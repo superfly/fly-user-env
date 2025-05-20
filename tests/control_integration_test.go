@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,6 +29,11 @@ func TestControlIntegration(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatalf("Failed to create test directory: %v", err)
 	}
+	// Create db subdirectory
+	dbDir := filepath.Join(dir, "db")
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		t.Fatalf("Failed to create db directory: %v", err)
+	}
 	defer os.RemoveAll(dir)
 
 	// Create supervisor with a dummy command
@@ -38,7 +44,7 @@ func TestControlIntegration(t *testing.T) {
 	defer supervisor.StopProcess()
 
 	// Create control instance
-	control := lib.NewControlWithConfig("localhost:8080", "test-token", supervisor, filepath.Join(dir, "config.json"), dir)
+	control := lib.NewControlWithConfig("localhost:8080", "test-token", "test-token", supervisor, filepath.Join(dir, "config.json"), dir)
 
 	// Create test server
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +124,8 @@ func TestControlIntegration(t *testing.T) {
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status 200, got %d", resp.StatusCode)
+			body, _ := io.ReadAll(resp.Body)
+			t.Logf("Response body: %s", body)
 		}
 
 		// Verify configuration was saved
