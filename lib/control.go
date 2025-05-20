@@ -7,12 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	lss3 "github.com/benbjohnson/litestream/s3"
 	// For types.NoSuchKey
 )
@@ -28,14 +26,15 @@ type StackComponent interface {
 // DBManagerComponent implements StackComponent for SQLite database management
 type DBManagerComponent struct {
 	dbManager *DBManager
+	dataDir   string
 }
 
-func NewDBManagerComponent() *DBManagerComponent {
-	return &DBManagerComponent{}
+func NewDBManagerComponent(dataDir string) *DBManagerComponent {
+	return &DBManagerComponent{dataDir: dataDir}
 }
 
 func (d *DBManagerComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
-	d.dbManager = NewDBManager(cfg)
+	d.dbManager = NewDBManager(cfg, d.dataDir)
 	if err := d.dbManager.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
@@ -62,6 +61,12 @@ type ObjectStorageConfig struct {
 	KeyPrefix string `json:"key_prefix"`
 }
 
+// SystemConfig represents the overall system configuration
+type SystemConfig struct {
+	Storage ObjectStorageConfig `json:"storage"`
+	Stacks  []string            `json:"stacks"` // List of stack components to enable
+}
+
 // AdminConfig holds configuration for the admin interface.
 type AdminConfig struct {
 	// TimeoutStop is the time to wait for graceful shutdown before force killing.
@@ -81,42 +86,152 @@ func DefaultAdminConfig() AdminConfig {
 	}
 }
 
-// Admin manages the admin interface and object storage configuration
-// NEVER use env vars or default credentials, wait for config to be posted
-// rule: Only configure S3 after config POST
-type Admin struct {
-	mu             sync.Mutex
-	s3cfg          aws.Config
-	s3Config       *ObjectStorageConfig
+// ControlConfig holds configuration for the control interface.
+type ControlConfig struct {
+	TargetAddr     string
+	ControllerAddr string
+	DataDir        string
+	ConfigPath     string
+	Token          string
+}
+
+// DefaultControlConfig returns a new ControlConfig with default values.
+func DefaultControlConfig() ControlConfig {
+	return ControlConfig{
+		TargetAddr:     "localhost:8080",
+		ControllerAddr: "localhost:8080",
+		DataDir:        "tmp",
+		ConfigPath:     "tmp/config.json",
+		Token:          "test-token",
+	}
+}
+
+// Control manages the control interface and object storage configuration
+// and provides methods for configuring and monitoring the system.
+type Control struct {
+	mu             sync.RWMutex
+	config         *SystemConfig
+	configPath     string
+	dataDir        string
 	targetAddr     string
 	controllerAddr string
+	token          string
 	supervisor     *Supervisor
+	dbManager      *DBManager
+	leaser         *lss3.Leaser
 	components     []StackComponent
 }
 
-// NewAdmin creates a new admin instance
-func NewAdmin(targetAddr, controllerAddr string, supervisor *Supervisor, components ...StackComponent) *Admin {
-	// Default to leaser + DB manager if no components provided
-	if len(components) == 0 {
-		components = []StackComponent{
-			NewLeaserComponent(),
-			NewDBManagerComponent(),
-		}
-	}
+// NewControl creates a new control instance
+func NewControl(targetAddr, controllerAddr, dataDir string, supervisor *Supervisor, components ...StackComponent) *Control {
+	return NewControlWithConfig(targetAddr, controllerAddr, supervisor, filepath.Join(dataDir, "config.json"), dataDir, components...)
+}
 
-	a := &Admin{
+// NewControlWithConfig creates a new control instance with a custom config path
+func NewControlWithConfig(targetAddr, controllerAddr string, supervisor *Supervisor, configPath, dataDir string, components ...StackComponent) *Control {
+	c := &Control{
 		targetAddr:     targetAddr,
 		controllerAddr: controllerAddr,
+		configPath:     configPath,
+		dataDir:        dataDir,
 		supervisor:     supervisor,
 		components:     components,
 	}
-	// NEVER use env vars or default credentials, wait for config to be posted
-	// S3 config/client will be created after config POST
-	return a
+
+	// Try to load existing config
+	if err := c.loadConfig(); err != nil {
+		log.Printf("No existing config found: %v", err)
+	}
+
+	return c
 }
 
-// ServeHTTP handles HTTP requests for the control interface
-func (c *Admin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error {
+	// If no stacks specified, use all components
+	if len(cfg.Stacks) == 0 {
+		for _, component := range c.components {
+			if err := component.Setup(ctx, &cfg.Storage); err != nil {
+				return fmt.Errorf("failed to setup component: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// Map of available components by name
+	availableComponents := map[string]StackComponent{
+		"leaser": NewLeaserComponent(),
+		"db":     NewDBManagerComponent(c.dataDir),
+	}
+
+	// Set up only the specified components
+	for _, stackName := range cfg.Stacks {
+		component, ok := availableComponents[stackName]
+		if !ok {
+			return fmt.Errorf("unknown stack component: %s", stackName)
+		}
+		if err := component.Setup(ctx, &cfg.Storage); err != nil {
+			return fmt.Errorf("failed to setup component %s: %w", stackName, err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Control) loadConfig() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Read config file
+	data, err := os.ReadFile(c.configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Parse config
+	var cfg SystemConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Store configs
+	c.config = &cfg
+
+	// Set up components
+	if err := c.setupComponents(context.Background(), &cfg); err != nil {
+		return fmt.Errorf("failed to set up components: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Control) saveConfig() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.config == nil {
+		return fmt.Errorf("no configuration to save")
+	}
+
+	// Create data directory if it doesn't exist
+	if err := os.MkdirAll(c.dataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	// Marshal config
+	data, err := json.MarshalIndent(c.config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// Write config file
+	if err := os.WriteFile(c.configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Host != "fly-app-controller" {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -143,65 +258,39 @@ func (c *Admin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleConfig processes POST requests to configure object storage
-func (c *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
-	var cfgData ObjectStorageConfig
+func (c *Control) handleConfig(w http.ResponseWriter, r *http.Request) {
+	var cfgData SystemConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfgData); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	// Validate required fields
-	if cfgData.Bucket == "" || cfgData.AccessKey == "" || cfgData.SecretKey == "" {
+	if cfgData.Storage.Bucket == "" || cfgData.Storage.Endpoint == "" ||
+		cfgData.Storage.AccessKey == "" || cfgData.Storage.SecretKey == "" {
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
 		return
 	}
 
-	// Store the configuration first
-	c.s3Config = &cfgData
+	// Store the configurations
+	c.config = &cfgData
 
-	// Create AWS config and S3 client using the posted config
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL: cfgData.Endpoint,
-		}, nil
-	})
-	awsCfg, err := config.LoadDefaultConfig(r.Context(),
-		config.WithEndpointResolverWithOptions(customResolver),
-		config.WithRegion(cfgData.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cfgData.AccessKey,
-			cfgData.SecretKey,
-			"",
-		)),
-	)
-	if err != nil {
-		http.Error(w, "Failed to create AWS config: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	c.s3cfg = awsCfg
-
-	// Set up each component in sequence
-	for _, component := range c.components {
-		if err := component.Setup(r.Context(), &cfgData); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to setup component: %v", err), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	// Start the process
-	if err := c.supervisor.StartProcess(); err != nil {
-		log.Printf("Failed to start process: %v", err)
-		http.Error(w, "Failed to start process", http.StatusInternalServerError)
+	// Save config to file
+	if err := c.saveConfig(); err != nil {
+		http.Error(w, "Failed to save configuration", http.StatusInternalServerError)
 		return
 	}
 
-	// Return success
+	// Set up components
+	if err := c.setupComponents(r.Context(), &cfgData); err != nil {
+		http.Error(w, "Failed to set up components", http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleStatus returns the current status of the controller
-func (c *Admin) handleStatus(w http.ResponseWriter, r *http.Request) {
+func (c *Control) handleStatus(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -209,7 +298,7 @@ func (c *Admin) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Configured bool `json:"configured"`
 		Running    bool `json:"running"`
 	}{
-		Configured: c.s3Config != nil,
+		Configured: c.config != nil,
 		Running:    c.supervisor != nil && c.supervisor.IsRunning(),
 	}
 
@@ -217,37 +306,31 @@ func (c *Admin) handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(status)
 }
 
-// Status returns the current status of the controller (intended for internal use perhaps, or if handleStatus is removed)
-// If this is a duplicate or unused, it might need to be removed. For now, fixing mu.
-func (c *Admin) Status() interface{} { // This method was added in a previous problematic diff, ensuring its mu is correct.
+func (c *Control) Status() interface{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return struct {
 		Configured bool `json:"configured"`
 		Running    bool `json:"running"`
 	}{
-		Configured: c.s3Config != nil,
+		Configured: c.config != nil,
 		Running:    c.supervisor != nil && c.supervisor.IsRunning(),
 	}
 }
 
-// GetStorageConfig returns the current object storage configuration
-// This method needs to be thread-safe
-func (c *Admin) GetStorageConfig() *ObjectStorageConfig {
+func (c *Control) GetStorageConfig() *ObjectStorageConfig {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.s3Config
+	return &c.config.Storage
 }
 
-// GetLeaser returns the current leaser instance (for testing only)
-func (c *Admin) GetLeaser() *lss3.Leaser {
+func (c *Control) GetLeaser() *lss3.Leaser {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.components[0].(*LeaserComponent).leaser
+	return c.leaser
 }
 
-// handleReleaseLease releases the current lease
-func (c *Admin) handleReleaseLease(w http.ResponseWriter, r *http.Request) {
+func (c *Control) handleReleaseLease(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -275,8 +358,7 @@ func (c *Admin) handleReleaseLease(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Configure S3 leaser for distributed locking
-func (c *Admin) configureS3Leaser(ctx context.Context, config *ObjectStorageConfig) error {
+func (c *Control) configureS3Leaser(ctx context.Context, config *ObjectStorageConfig) error {
 	leaser := lss3.NewLeaser()
 	leaser.Bucket = config.Bucket
 	leaser.Endpoint = config.Endpoint
@@ -292,7 +374,7 @@ func (c *Admin) configureS3Leaser(ctx context.Context, config *ObjectStorageConf
 		return fmt.Errorf("failed to open leaser: %w", err)
 	}
 
-	c.components[0] = &LeaserComponent{leaser: leaser, owner: os.Getenv("HOSTNAME")}
+	c.leaser = leaser
 
 	// Start the process
 	if err := c.supervisor.StartProcess(); err != nil {

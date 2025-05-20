@@ -24,10 +24,10 @@ type DBManager struct {
 }
 
 // NewDBManager creates a new database manager instance
-func NewDBManager(config *ObjectStorageConfig) *DBManager {
+func NewDBManager(config *ObjectStorageConfig, dataDir string) *DBManager {
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
-		dbPath = filepath.Join("data", "db", "app.sqlite")
+		dbPath = filepath.Join(dataDir, "db", "app.sqlite")
 	}
 	return &DBManager{
 		DBPath: dbPath,

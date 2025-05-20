@@ -2,11 +2,13 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"supervisor/cmd"
+	"supervisor/lib"
 )
 
 func main() {
@@ -15,6 +17,22 @@ func main() {
 		log.Printf("Error: %v", err)
 		os.Exit(1)
 	}
+
+	// Create control with default components
+	control := lib.NewControl("localhost:8080", "test-token", "tmp", supervisor)
+
+	// Create HTTP server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		control.ServeHTTP(w, r)
+	})
+
+	// Start server
+	go func() {
+		if err := http.ListenAndServe(":8080", mux); err != nil {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

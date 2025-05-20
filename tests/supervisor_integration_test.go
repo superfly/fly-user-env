@@ -51,7 +51,9 @@ func TestSupervisorIntegration(t *testing.T) {
 				Region:    "auto",
 				KeyPrefix: "test-" + scenario + "/",
 			}
-			dm := lib.NewDBManager(config)
+			// Create DBManager with a unique tmpDir
+			tmpDir := t.TempDir()
+			dm := lib.NewDBManager(config, tmpDir)
 			dm.DBPath = filepath.Join(dir, "app.sqlite")
 
 			// Test Initialize

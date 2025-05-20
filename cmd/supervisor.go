@@ -98,7 +98,8 @@ func RunSupervisor() (error, *Cleanup, *lib.Supervisor) {
 		TimeoutStop:  config.TimeoutStop,
 		RestartDelay: config.RestartDelay,
 	})
-	admin := lib.NewAdmin(*targetAddr, token, supervisor)
+	// Create control instance
+	control := lib.NewControl("localhost:8080", "test-token", "tmp", supervisor)
 
 	proxy, err := lib.New(*targetAddr, supervisor)
 	if err != nil {
@@ -109,7 +110,7 @@ func RunSupervisor() (error, *Cleanup, *lib.Supervisor) {
 		host := r.Host
 		if strings.EqualFold(host, "fly-app-controller") {
 			log.Printf("[supervisor] Routing to admin interface for host: %s", host)
-			admin.ServeHTTP(w, r)
+			control.ServeHTTP(w, r)
 			return
 		}
 		log.Printf("[supervisor] Routing to proxy for host: %s", host)
