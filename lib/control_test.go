@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // MockComponent is a test implementation of StackComponent
@@ -22,7 +23,10 @@ func (m *MockComponent) Cleanup(ctx context.Context) error {
 
 func TestAdmin(t *testing.T) {
 	// Create supervisor with a dummy command
-	supervisor := NewSupervisor([]string{"tail", "-f", "/dev/null"})
+	supervisor := NewSupervisor([]string{"tail", "-f", "/dev/null"}, SupervisorConfig{
+		TimeoutStop:  5 * time.Second,
+		RestartDelay: time.Second,
+	})
 	defer supervisor.StopProcess()
 
 	// Create admin with default components
@@ -109,7 +113,10 @@ func TestAdmin(t *testing.T) {
 
 func TestAdminMethodNotAllowed(t *testing.T) {
 	// Create supervisor with a dummy command
-	supervisor := NewSupervisor([]string{"tail", "-f", "/dev/null"})
+	supervisor := NewSupervisor([]string{"tail", "-f", "/dev/null"}, SupervisorConfig{
+		TimeoutStop:  5 * time.Second,
+		RestartDelay: time.Second,
+	})
 	defer supervisor.StopProcess()
 
 	// Create admin with default components

@@ -70,7 +70,7 @@ func (c *Cleanup) Errors() []error {
 //   - CONTROLLER_TOKEN: Token for admin interface access
 //
 // Returns an error if the service fails to start, and a cleanup function that should be called on shutdown.
-func RunSupervisor() (error, *Cleanup) {
+func RunSupervisor() (error, *Cleanup, *lib.Supervisor) {
 	cleanup := &Cleanup{}
 
 	listenAddr := flag.String("listen", "0.0.0.0:8080", "Address to listen on")
@@ -78,25 +78,31 @@ func RunSupervisor() (error, *Cleanup) {
 	flag.Parse()
 
 	if *targetAddr == "" {
-		return fmt.Errorf("--target flag is required"), cleanup
+		return fmt.Errorf("--target flag is required"), cleanup, nil
 	}
 
 	args := flag.Args()
 	if len(args) == 0 {
-		return fmt.Errorf("command to supervise is required"), cleanup
+		return fmt.Errorf("command to supervise is required"), cleanup, nil
 	}
 
 	token := os.Getenv("CONTROLLER_TOKEN")
 	if token == "" {
-		return fmt.Errorf("CONTROLLER_TOKEN environment variable is required for controller access"), cleanup
+		return fmt.Errorf("CONTROLLER_TOKEN environment variable is required for controller access"), cleanup, nil
 	}
 
-	supervisor := lib.NewSupervisor(args)
+	// Get default config
+	config := lib.DefaultAdminConfig()
+
+	supervisor := lib.NewSupervisor(args, lib.SupervisorConfig{
+		TimeoutStop:  config.TimeoutStop,
+		RestartDelay: config.RestartDelay,
+	})
 	admin := lib.NewAdmin(*targetAddr, token, supervisor)
 
 	proxy, err := lib.New(*targetAddr, supervisor)
 	if err != nil {
-		return fmt.Errorf("failed to create proxy: %v", err), cleanup
+		return fmt.Errorf("failed to create proxy: %v", err), cleanup, nil
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,5 +138,5 @@ func RunSupervisor() (error, *Cleanup) {
 		}
 	}()
 
-	return nil, cleanup
+	return nil, cleanup, supervisor
 }

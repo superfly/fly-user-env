@@ -4,7 +4,6 @@
 package lib
 
 import (
-	"bufio"
 	"fmt"
 	"log"
 	"os"
@@ -18,20 +17,42 @@ import (
 // It handles process lifecycle, output redirection, and automatic restart on failure.
 type Supervisor struct {
 	command []string
+	config  SupervisorConfig
 	process struct {
 		sync.RWMutex
 		running bool
+		stopped bool // Flag to track if process was stopped intentionally
 		cmd     *exec.Cmd
 		pid     int
 	}
 }
 
+// SupervisorConfig holds configuration for the supervisor.
+type SupervisorConfig struct {
+	// TimeoutStop is the time to wait for graceful shutdown before force killing.
+	// Defaults to 90 seconds if not set (matching systemd's default).
+	TimeoutStop time.Duration
+
+	// RestartDelay is the time to wait before restarting a failed process.
+	// Defaults to 100ms if not set (matching systemd's default).
+	RestartDelay time.Duration
+}
+
 // NewSupervisor creates a new supervisor instance for the given command.
 // The command is specified as a slice of strings where the first element
 // is the executable path and subsequent elements are arguments.
-func NewSupervisor(command []string) *Supervisor {
+func NewSupervisor(command []string, config SupervisorConfig) *Supervisor {
+	// Set defaults if not specified
+	if config.TimeoutStop == 0 {
+		config.TimeoutStop = 90 * time.Second
+	}
+	if config.RestartDelay == 0 {
+		config.RestartDelay = time.Second
+	}
+
 	return &Supervisor{
 		command: command,
+		config:  config,
 	}
 }
 
@@ -58,7 +79,7 @@ func (s *Supervisor) IsRunning() bool {
 
 // StartProcess starts the supervised process and sets up output handling.
 // It returns an error if the process is already running or if starting fails.
-// The process will be automatically restarted if it exits.
+// The process will be automatically restarted if it exits unexpectedly.
 func (s *Supervisor) StartProcess() error {
 	s.process.Lock()
 	defer s.process.Unlock()
@@ -73,31 +94,13 @@ func (s *Supervisor) StartProcess() error {
 
 	cmd := exec.Command(s.command[0], s.command[1:]...)
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %v", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %v", err)
-	}
+	// Forward child process stdout/stderr directly to parent's stdout/stderr.
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start process: %v", err)
 	}
-
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			log.Printf("[PROCESS STDOUT] %s", scanner.Text())
-		}
-	}()
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			log.Printf("[PROCESS STDERR] %s", scanner.Text())
-		}
-	}()
 
 	go func() {
 		err := cmd.Wait()
@@ -105,19 +108,25 @@ func (s *Supervisor) StartProcess() error {
 		s.process.running = false
 		s.process.cmd = nil
 		s.process.pid = 0
+		// Only restart if the process wasn't stopped intentionally
+		shouldRestart := !s.process.stopped
+		s.process.stopped = false // Reset the flag
 		s.process.Unlock()
 		if err != nil {
 			log.Printf("Process exited with error: %v", err)
 		} else {
 			log.Printf("Process exited successfully")
 		}
-		time.Sleep(time.Second)
-		if err := s.StartProcess(); err != nil {
-			log.Printf("Failed to restart process: %v", err)
+		if shouldRestart {
+			time.Sleep(s.config.RestartDelay)
+			if err := s.StartProcess(); err != nil {
+				log.Printf("Failed to restart process: %v", err)
+			}
 		}
 	}()
 
 	s.process.running = true
+	s.process.stopped = false
 	s.process.cmd = cmd
 	s.process.pid = cmd.Process.Pid
 	log.Printf("Started process with PID %d: %v", s.process.pid, s.command)
@@ -136,9 +145,44 @@ func (s *Supervisor) StopProcess() error {
 		return nil
 	}
 
+	// Mark that we're stopping the process intentionally
+	s.process.stopped = true
+
 	if s.process.cmd != nil && s.process.cmd.Process != nil {
-		if err := s.process.cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("failed to kill process: %v", err)
+		// Create a channel to wait for process exit
+		done := make(chan error, 1)
+		go func() {
+			done <- s.process.cmd.Wait()
+		}()
+
+		// First try SIGTERM for graceful shutdown
+		log.Printf("Sending SIGTERM to process %d", s.process.pid)
+		if err := s.process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return fmt.Errorf("failed to send SIGTERM: %v", err)
+		}
+
+		// Wait for process to exit or timeout
+		select {
+		case err := <-done:
+			if err != nil {
+				log.Printf("Process %d exited with error: %v", s.process.pid, err)
+			} else {
+				log.Printf("Process %d exited successfully", s.process.pid)
+			}
+		case <-time.After(s.config.TimeoutStop):
+			// Process didn't exit in time, send SIGKILL
+			log.Printf("Process %d did not exit within %v, sending SIGKILL",
+				s.process.pid, s.config.TimeoutStop)
+			if err := s.process.cmd.Process.Kill(); err != nil {
+				return fmt.Errorf("failed to kill process: %v", err)
+			}
+			// Wait for the kill to take effect
+			<-done
+		}
+
+		// Ensure process is cleaned up
+		if s.process.cmd.Process != nil {
+			s.process.cmd.Process.Release()
 		}
 	}
 
@@ -146,4 +190,15 @@ func (s *Supervisor) StopProcess() error {
 	s.process.cmd = nil
 	s.process.pid = 0
 	return nil
+}
+
+// ForwardSignal sends the given signal to the supervised process if it is running.
+func (s *Supervisor) ForwardSignal(sig os.Signal) error {
+	s.process.RLock()
+	defer s.process.RUnlock()
+
+	if !s.process.running || s.process.cmd == nil || s.process.cmd.Process == nil {
+		return nil
+	}
+	return s.process.cmd.Process.Signal(sig)
 }

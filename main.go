@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	err, cleanup := cmd.RunSupervisor()
+	err, cleanup, supervisor := cmd.RunSupervisor()
 	if err != nil {
 		log.Printf("Error: %v", err)
 		os.Exit(1)
@@ -19,7 +19,17 @@ func main() {
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+
+	for {
+		sig := <-sigChan
+		log.Printf("Received signal: %v, forwarding to supervised process", sig)
+		if supervisor != nil {
+			supervisor.ForwardSignal(sig)
+		}
+		if sig == syscall.SIGINT || sig == syscall.SIGTERM {
+			break
+		}
+	}
 
 	log.Printf("Shutting down...")
 	cleanup.Execute()

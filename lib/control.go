@@ -62,6 +62,25 @@ type ObjectStorageConfig struct {
 	KeyPrefix string `json:"key_prefix"`
 }
 
+// AdminConfig holds configuration for the admin interface.
+type AdminConfig struct {
+	// TimeoutStop is the time to wait for graceful shutdown before force killing.
+	// Defaults to 90 seconds if not set (matching systemd's default).
+	TimeoutStop time.Duration `yaml:"timeout_stop"`
+
+	// RestartDelay is the time to wait before restarting a failed process.
+	// Defaults to 100ms if not set (matching systemd's default).
+	RestartDelay time.Duration `yaml:"restart_delay"`
+}
+
+// DefaultAdminConfig returns a new AdminConfig with default values.
+func DefaultAdminConfig() AdminConfig {
+	return AdminConfig{
+		TimeoutStop:  90 * time.Second,
+		RestartDelay: time.Second,
+	}
+}
+
 // Admin manages the admin interface and object storage configuration
 // NEVER use env vars or default credentials, wait for config to be posted
 // rule: Only configure S3 after config POST

@@ -21,6 +21,13 @@ supervisor [flags] command [args...]
 - `--listen` - Address to listen on (default: "0.0.0.0:8080")
 - `--target` - Address to proxy to (required)
 
+### Configuration
+
+The supervisor can be configured through the admin interface. Configuration options include:
+
+- `timeout_stop_sec` - Time to wait for graceful shutdown before force killing (default: 5)
+- `restart_sec` - Time to wait before restarting a failed process (default: 1)
+
 ### Examples
 
 ```bash
