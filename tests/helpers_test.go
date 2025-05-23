@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"supervisor/lib"
@@ -30,6 +31,8 @@ func SetupConfiguredControlServer(t *testing.T, stacks []string, dir string) (*h
 			components = append(components, lib.NewDBManagerComponent(dir))
 		case "leaser":
 			components = append(components, lib.NewLeaserComponent())
+		case "juicefs":
+			components = append(components, lib.NewJuiceFSComponent(filepath.Join(dir, "juicefs")))
 		}
 	}
 

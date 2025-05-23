@@ -91,6 +91,7 @@ type ObjectStorageConfig struct {
 	SecretKey string `json:"secret_key"`
 	Region    string `json:"region"`
 	KeyPrefix string `json:"key_prefix"`
+	EnvDir    string `json:"env_dir"`
 }
 
 // SystemConfig represents the overall system configuration
@@ -188,6 +189,8 @@ func (c *Control) getAvailableComponents() map[string]StackComponent {
 			components["db"] = comp
 		case *LeaserComponent:
 			components["leaser"] = comp
+		case *JuiceFSComponent:
+			components["juicefs"] = comp
 		}
 	}
 	return components
