@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 
-	"net/http/httptest"
 	"supervisor/lib"
 )
 
@@ -29,36 +27,26 @@ func TestControlIntegration(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatalf("Failed to create test directory: %v", err)
 	}
-	// Create db subdirectory
-	dbDir := filepath.Join(dir, "db")
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		t.Fatalf("Failed to create db directory: %v", err)
-	}
 	defer os.RemoveAll(dir)
 
-	// Create supervisor with a dummy command
-	supervisor := lib.NewSupervisor([]string{"tail", "-f", "/dev/null"}, lib.SupervisorConfig{
-		TimeoutStop:  5 * time.Second,
-		RestartDelay: time.Second,
-	})
-	defer supervisor.StopProcess()
+	// Create control server WITHOUT configuring it
+	components := []lib.StackComponent{
+		lib.NewLeaserComponent(),
+		lib.NewDBManagerComponent(dir),
+	}
+	control := lib.NewControl(
+		"localhost:8080",
+		"localhost:8080",
+		"test-token",
+		dir,
+		nil, // supervisor not needed for this test
+		components...,
+	)
+	server := httptest.NewServer(control)
+	defer server.Close()
 
-	// Create control instance
-	control := lib.NewControlWithConfig("localhost:8080", "test-token", "test-token", supervisor, filepath.Join(dir, "config.json"), dir)
-
-	// Create test server
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.EqualFold(r.Host, "fly-app-controller") {
-			http.Error(w, "Not Found", http.StatusNotFound)
-			return
-		}
-		control.ServeHTTP(w, r)
-	}))
-	defer ts.Close()
-
-	// Test cases
 	t.Run("Initial status", func(t *testing.T) {
-		req, err := http.NewRequest("GET", ts.URL, nil)
+		req, err := http.NewRequest("GET", server.URL, nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
@@ -90,25 +78,25 @@ func TestControlIntegration(t *testing.T) {
 		}
 	})
 
+	// Now configure the control server
+	config := lib.SystemConfig{
+		Storage: lib.ObjectStorageConfig{
+			Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
+			Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
+			AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
+			SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
+			Region:    "auto",
+		},
+		Stacks: []string{"leaser", "db"},
+	}
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("Failed to marshal config: %v", err)
+	}
+
 	t.Run("Configure with all stacks", func(t *testing.T) {
-		// Test configuration with all stacks
-		config := lib.SystemConfig{
-			Storage: lib.ObjectStorageConfig{
-				Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
-				Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
-				AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
-				SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
-				Region:    "auto",
-			},
-			Stacks: []string{"db", "leaser"},
-		}
-
-		configJSON, err := json.Marshal(config)
-		if err != nil {
-			t.Fatalf("Failed to marshal config: %v", err)
-		}
-
-		req, err := http.NewRequest("POST", ts.URL, bytes.NewBuffer(configJSON))
+		req, err := http.NewRequest("POST", server.URL, bytes.NewBuffer(configJSON))
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
@@ -152,7 +140,7 @@ func TestControlIntegration(t *testing.T) {
 			t.Fatalf("Failed to marshal config: %v", err)
 		}
 
-		req, err := http.NewRequest("POST", ts.URL, bytes.NewBuffer(configJSON))
+		req, err := http.NewRequest("POST", server.URL, bytes.NewBuffer(configJSON))
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
@@ -185,7 +173,7 @@ func TestControlIntegration(t *testing.T) {
 			t.Fatalf("Failed to marshal config: %v", err)
 		}
 
-		req, err := http.NewRequest("POST", ts.URL, bytes.NewBuffer(configJSON))
+		req, err := http.NewRequest("POST", server.URL, bytes.NewBuffer(configJSON))
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}

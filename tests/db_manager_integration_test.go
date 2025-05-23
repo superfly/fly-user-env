@@ -6,99 +6,68 @@ import (
 	"path/filepath"
 	"testing"
 
-	"supervisor/lib"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	_ "github.com/mattn/go-sqlite3"
+	"supervisor/lib"
 )
 
 func TestDBManagerIntegration(t *testing.T) {
-	// Skip if required env vars are not set
-	if os.Getenv("FLY_TIGRIS_BUCKET") == "" ||
-		os.Getenv("FLY_TIGRIS_ENDPOINT_URL") == "" ||
-		os.Getenv("FLY_TIGRIS_ACCESS_KEY") == "" ||
-		os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY") == "" {
-		t.Skip("Skipping integration test. Set FLY_TIGRIS_* environment variables to run.")
+	// Check for required environment variables
+	requiredEnvVars := []string{
+		"FLY_TIGRIS_BUCKET",
+		"FLY_TIGRIS_ENDPOINT_URL",
+		"FLY_TIGRIS_ACCESS_KEY",
+		"FLY_TIGRIS_SECRET_ACCESS_KEY",
 	}
 
-	// Create test directories in ./tmp/
-	scenarios := []string{"no_db", "existing_db"}
-	for _, scenario := range scenarios {
-		dir := filepath.Join("..", "tmp", scenario)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			t.Fatalf("Failed to create test directory %s: %v", dir, err)
+	for _, envVar := range requiredEnvVars {
+		if os.Getenv(envVar) == "" {
+			t.Skipf("Skipping test: %s environment variable not set", envVar)
 		}
-		defer os.RemoveAll(dir)
 	}
 
-	// Test full functionality in each scenario
-	for _, scenario := range scenarios {
-		t.Run(scenario, func(t *testing.T) {
-			dir := filepath.Join("..", "tmp", scenario)
-			config := &lib.ObjectStorageConfig{
-				Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
-				Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
-				AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
-				SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
-				Region:    "auto",
-				KeyPrefix: "test-" + scenario + "/",
-			}
-			// Create DBManager with a unique tmpDir
-			tmpDir := t.TempDir()
-			dm := lib.NewDBManager(config, tmpDir)
-			dm.DBPath = filepath.Join(dir, "app.sqlite")
+	// Create test directory
+	testDir := filepath.Join(t.TempDir(), "test-db")
+	require.NoError(t, os.MkdirAll(testDir, 0755))
 
-			// Test Initialize
-			if err := dm.Initialize(); err != nil {
-				t.Fatalf("Initialize failed: %v", err)
-			}
-
-			// Verify database file exists
-			if _, err := os.Stat(dm.ActiveDBPath); os.IsNotExist(err) {
-				t.Errorf("Database file does not exist at %s", dm.ActiveDBPath)
-			}
-
-			// Verify symlink exists and points to the database file
-			if _, err := os.Stat(dm.DBPath); os.IsNotExist(err) {
-				t.Errorf("Database symlink does not exist at %s", dm.DBPath)
-			}
-
-			// Test basic SQLite operations
-			db, err := sql.Open("sqlite3", dm.DBPath)
-			if err != nil {
-				t.Fatalf("Failed to open database: %v", err)
-			}
-			defer db.Close()
-
-			// Create a test table
-			_, err = db.Exec(`
-				CREATE TABLE IF NOT EXISTS test_table (
-					id INTEGER PRIMARY KEY,
-					value TEXT,
-					created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-				)
-			`)
-			if err != nil {
-				t.Fatalf("Failed to create test table: %v", err)
-			}
-
-			// Insert test data
-			initialValue := "test-value-" + scenario
-			_, err = db.Exec(`
-				INSERT INTO test_table (value) VALUES (?)
-			`, initialValue)
-			if err != nil {
-				t.Fatalf("Failed to insert test data: %v", err)
-			}
-
-			// Verify data was inserted
-			var value string
-			err = db.QueryRow("SELECT value FROM test_table WHERE id = 1").Scan(&value)
-			if err != nil {
-				t.Fatalf("Failed to query test data: %v", err)
-			}
-			if value != initialValue {
-				t.Errorf("Expected value '%s', got '%s'", initialValue, value)
-			}
-		})
+	// Initialize DBManager
+	config := &lib.ObjectStorageConfig{
+		Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
+		Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
+		AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
+		SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
+		Region:    "us-east-1",
 	}
+
+	dm := lib.NewDBManager(config, testDir)
+	require.NoError(t, dm.Initialize())
+
+	// Test basic database operations
+	db, err := sql.Open("sqlite3", dm.DBPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create test table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS test (
+			id INTEGER PRIMARY KEY,
+			value TEXT
+		)
+	`)
+	require.NoError(t, err)
+
+	// Insert test data
+	_, err = db.Exec("INSERT INTO test (value) VALUES (?)", "test-value")
+	require.NoError(t, err)
+
+	// Verify data
+	var value string
+	err = db.QueryRow("SELECT value FROM test WHERE id = 1").Scan(&value)
+	require.NoError(t, err)
+	assert.Equal(t, "test-value", value)
+
+	// Test replication
+	require.NoError(t, dm.StartReplication())
+	require.NoError(t, dm.StopReplication())
 }

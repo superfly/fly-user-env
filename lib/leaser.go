@@ -60,3 +60,20 @@ func (l *LeaserComponent) Cleanup(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (l *LeaserComponent) ReleaseAllLeases(ctx context.Context) error {
+	if l.Leaser != nil {
+		// Get all epochs to find active leases
+		epochs, err := l.Leaser.Epochs(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list epochs: %w", err)
+		}
+		// Release each lease
+		for _, epoch := range epochs {
+			if err := l.Leaser.ReleaseLease(ctx, epoch); err != nil {
+				return fmt.Errorf("failed to release lease %d: %w", epoch, err)
+			}
+		}
+	}
+	return nil
+}

@@ -1,6 +1,8 @@
 ---
 description: 
-globs: reference/**/*
+globs: reference/**/*,litestream/*
 alwaysApply: false
 ---
 Files in the reference directory are for reading and reference only. Never make changes to them, or include them in other work.
+
+Don't read from submodules without asking. These are only for reference and you will only need them at certain times.

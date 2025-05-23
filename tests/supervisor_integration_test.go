@@ -54,8 +54,16 @@ func TestSupervisorIntegration(t *testing.T) {
 			}
 			// Create DBManager with a unique tmpDir
 			tmpDir := t.TempDir()
+			// Ensure parent directory exists for DBPath
+			dbPath, err := filepath.Abs(filepath.Join(dir, "app.sqlite"))
+			if err != nil {
+				t.Fatalf("Failed to get absolute path for DBPath: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+				t.Fatalf("Failed to create parent directory for DBPath: %v", err)
+			}
 			dm := lib.NewDBManager(config, tmpDir)
-			dm.DBPath = filepath.Join(dir, "app.sqlite")
+			dm.DBPath = dbPath
 
 			// Test Initialize
 			if err := dm.Initialize(); err != nil {

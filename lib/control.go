@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
-	"github.com/benbjohnson/litestream"
 	lss3 "github.com/benbjohnson/litestream/s3"
 	// For types.NoSuchKey
 )
@@ -34,6 +34,8 @@ type CheckpointableComponent interface {
 }
 
 // DBManagerComponent implements StackComponent and CheckpointableComponent
+// rule: DBManagerComponent is not checkpointable for now, so these methods are no-ops
+
 type DBManagerComponent struct {
 	dbManager *DBManager
 	dataDir   string
@@ -46,7 +48,7 @@ func NewDBManagerComponent(dataDir string) *DBManagerComponent {
 func (d *DBManagerComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
 	log.Printf("DBManagerComponent.Setup: dataDir=%s", d.dataDir)
 	d.dbManager = NewDBManager(cfg, d.dataDir)
-	log.Printf("DBManagerComponent.Setup: ActiveDBPath=%s", d.dbManager.ActiveDBPath)
+	log.Printf("DBManagerComponent.Setup: DBPath=%s", d.dbManager.DBPath)
 	if err := d.dbManager.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
@@ -63,82 +65,22 @@ func (d *DBManagerComponent) Cleanup(ctx context.Context) error {
 	return nil
 }
 
-// CreateCheckpoint creates a checkpoint of the database state and returns a checkpoint identifier
+// No-op: DBManagerComponent is not checkpointable for now
 func (d *DBManagerComponent) CreateCheckpoint(ctx context.Context, id string) (string, error) {
-	if d.dbManager == nil {
-		return "", fmt.Errorf("database manager not initialized")
-	}
-
-	// Get current position from the database
-	lsdb := d.dbManager.litestreamDB()
-	pos, err := lsdb.Pos()
-	if err != nil {
-		return "", fmt.Errorf("failed to get database position: %w", err)
-	}
-
-	// Create checkpoint identifier that includes:
-	// - The provided ID
-	// - The Litestream position (generation, index, offset)
-	// - Timestamp
-	checkpointID := fmt.Sprintf("%s-%s-%d-%d-%d",
-		id,
-		pos.Generation,
-		pos.Index,
-		pos.Offset,
-		time.Now().UnixNano())
-
-	return checkpointID, nil
+	return id, nil
 }
 
-// RestoreToCheckpoint restores the database to the state at the given checkpoint ID.
-// If id is empty, it restores to the latest state.
+// No-op: DBManagerComponent is not checkpointable for now
 func (d *DBManagerComponent) RestoreToCheckpoint(ctx context.Context, id string) error {
-	if d.dbManager == nil {
-		return fmt.Errorf("database manager not initialized")
-	}
-
-	// Stop replication before restore
-	if err := d.dbManager.StopReplication(); err != nil {
-		return fmt.Errorf("failed to stop replication: %w", err)
-	}
-
-	// Get the replica and restore options
-	lsdb := d.dbManager.litestreamDB()
-	if len(lsdb.Replicas) == 0 {
-		return fmt.Errorf("no replicas configured")
-	}
-	replica := lsdb.Replicas[0]
-
-	// Create restore options
-	opt := litestream.NewRestoreOptions()
-	opt.OutputPath = d.dbManager.ActiveDBPath
-
-	if id == "" {
-		// For latest state, let Litestream calculate the restore target
-		var err error
-		if opt.Generation, _, err = replica.CalcRestoreTarget(ctx, opt); err != nil {
-			return fmt.Errorf("failed to calculate restore target: %w", err)
-		}
-	} else {
-		// For now, just restore to latest state for the given ID
-		// In the future, we'll use the checkpoint identifier to restore to the exact point
-		var err error
-		if opt.Generation, _, err = replica.CalcRestoreTarget(ctx, opt); err != nil {
-			return fmt.Errorf("failed to calculate restore target: %w", err)
-		}
-	}
-
-	// Restore the database
-	if err := replica.Restore(ctx, opt); err != nil {
-		return fmt.Errorf("failed to restore database: %w", err)
-	}
-
-	// Restart replication
-	if err := d.dbManager.StartReplication(); err != nil {
-		return fmt.Errorf("failed to restart replication: %w", err)
-	}
-
 	return nil
+}
+
+// abs returns the absolute value of a duration
+func abs(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 // ObjectStorageConfig represents the configuration for object storage
@@ -239,10 +181,16 @@ func NewControlWithConfig(targetAddr, controllerAddr, token string, supervisor *
 
 // getAvailableComponents returns a map of available components by name
 func (c *Control) getAvailableComponents() map[string]StackComponent {
-	return map[string]StackComponent{
-		"leaser": NewLeaserComponent(),
-		"db":     NewDBManagerComponent(c.dataDir),
+	components := make(map[string]StackComponent)
+	for _, component := range c.components {
+		switch comp := component.(type) {
+		case *DBManagerComponent:
+			components["db"] = comp
+		case *LeaserComponent:
+			components["leaser"] = comp
+		}
 	}
+	return components
 }
 
 func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error {
@@ -345,6 +293,8 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.handleReleaseLease(w, r)
 		case "/checkpoint":
 			c.handleCheckpoint(w, r)
+		case "/restore":
+			c.handleRestore(w, r)
 		default:
 			c.handleConfig(w, r)
 		}
@@ -431,27 +381,25 @@ func (c *Control) handleReleaseLease(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	leaser := c.GetLeaser()
-	if leaser == nil {
-		http.Error(w, "No active lease", http.StatusNotFound)
-		return
-	}
-
-	// Get all epochs to find active leases
-	epochs, err := leaser.Epochs(r.Context())
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to list epochs: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Release each lease
-	for _, epoch := range epochs {
-		if err := leaser.ReleaseLease(r.Context(), epoch); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to release lease %d: %v", epoch, err), http.StatusInternalServerError)
-			return
+	var leaserComponent *LeaserComponent
+	for _, comp := range c.components {
+		if lc, ok := comp.(*LeaserComponent); ok {
+			leaserComponent = lc
+			break
 		}
 	}
-
+	if leaserComponent == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No active leaser component"})
+		return
+	}
+	if err := leaserComponent.ReleaseAllLeases(r.Context()); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -487,58 +435,119 @@ func (c *Control) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	defer c.mu.Unlock()
 
 	if c.config == nil {
-		http.Error(w, "Not configured", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Not configured",
+			"stack": string(debug.Stack()),
+		})
 		return
 	}
 
-	// Generate a unique checkpoint ID
-	checkpointID := fmt.Sprintf("checkpoint-%d", time.Now().UnixNano())
-
-	// Create a response structure
-	type ComponentCheckpoint struct {
-		ID string `json:"id"`
+	var req struct {
+		CheckpointID string `json:"checkpoint_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Invalid request body: %v", err)})
+		return
 	}
 
-	type CheckpointResponse struct {
-		Config struct {
-			Storage struct {
-				Bucket    string `json:"bucket"`
-				Endpoint  string `json:"endpoint"`
-				Region    string `json:"region"`
-				KeyPrefix string `json:"key_prefix"`
-			} `json:"storage"`
-			Stacks []string `json:"stacks"`
-		} `json:"config"`
-		Checkpoints map[string]ComponentCheckpoint `json:"checkpoints"`
+	if req.CheckpointID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Checkpoint ID is required"})
+		return
 	}
 
-	response := CheckpointResponse{
-		Checkpoints: make(map[string]ComponentCheckpoint),
+	checkpointables := []CheckpointableComponent{}
+	for _, comp := range c.components {
+		if cc, ok := comp.(CheckpointableComponent); ok {
+			checkpointables = append(checkpointables, cc)
+		}
+	}
+	if len(checkpointables) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No checkpointable components available"})
+		return
 	}
 
-	// Copy config without sensitive data
-	response.Config.Storage.Bucket = c.config.Storage.Bucket
-	response.Config.Storage.Endpoint = c.config.Storage.Endpoint
-	response.Config.Storage.Region = c.config.Storage.Region
-	response.Config.Storage.KeyPrefix = c.config.Storage.KeyPrefix
-	response.Config.Stacks = c.config.Stacks
+	results := make(map[string]string)
+	for _, cc := range checkpointables {
+		id, err := cc.CreateCheckpoint(r.Context(), req.CheckpointID)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		results[fmt.Sprintf("%T", cc)] = id
+	}
 
-	// Create checkpoints for all checkpointable components
-	for stackName, component := range c.getAvailableComponents() {
-		if checkpointable, ok := component.(CheckpointableComponent); ok {
-			// Create checkpoint
-			componentCheckpointID, err := checkpointable.CreateCheckpoint(r.Context(), checkpointID)
-			if err != nil {
-				http.Error(w, "Failed to create checkpoint", http.StatusInternalServerError)
-				return
-			}
-			response.Checkpoints[stackName] = ComponentCheckpoint{
-				ID: componentCheckpointID,
-			}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "success",
+		"checkpoint_id": req.CheckpointID,
+		"results":       results,
+	})
+}
+
+// handleRestore restores all checkpointable components to the specified checkpoint
+func (c *Control) handleRestore(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.config == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Not configured"})
+		return
+	}
+
+	var req struct {
+		CheckpointID string `json:"checkpoint_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Invalid request body: %v", err)})
+		return
+	}
+
+	if req.CheckpointID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Checkpoint ID is required"})
+		return
+	}
+
+	checkpointables := []CheckpointableComponent{}
+	for _, comp := range c.components {
+		if cc, ok := comp.(CheckpointableComponent); ok {
+			checkpointables = append(checkpointables, cc)
+		}
+	}
+	if len(checkpointables) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No checkpointable components available"})
+		return
+	}
+
+	for _, cc := range checkpointables {
+		if err := cc.RestoreToCheckpoint(r.Context(), req.CheckpointID); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
 		}
 	}
 
-	// Send response
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "success",
+		"checkpoint_id": req.CheckpointID,
+	})
 }
