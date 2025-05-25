@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 )
@@ -23,7 +24,7 @@ func NewJuiceFSComponent() *JuiceFSComponent {
 }
 
 // Setup initializes the JuiceFS component with the given config
-func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
+func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, juicefsPath string) error {
 	j.config = cfg
 
 	// Create mount directory
@@ -32,8 +33,14 @@ func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) 
 		return fmt.Errorf("failed to create mount directory: %w", err)
 	}
 
+	// Create db directory
+	dbDir := filepath.Join(cfg.EnvDir, "db")
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		return fmt.Errorf("failed to create db directory: %w", err)
+	}
+
 	// Initialize SQLite database for metadata
-	dbPath := filepath.Join(cfg.EnvDir, "db", "juicefs.sqlite")
+	dbPath := filepath.Join(dbDir, "juicefs.sqlite")
 	j.dbManager = NewDBManager(cfg, filepath.Join(cfg.EnvDir, "db"))
 	j.dbManager.DBPath = dbPath
 	if err := j.dbManager.Initialize(); err != nil {
@@ -43,39 +50,63 @@ func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) 
 		return fmt.Errorf("failed to start replication: %w", err)
 	}
 
+	// Compose bucket as endpoint/bucket
+	bucketURL := fmt.Sprintf("%s/%s", cfg.Endpoint, cfg.Bucket)
+
 	// Format the filesystem if it doesn't exist
-	formatCmd := exec.CommandContext(ctx, "juicefs", "format",
+	formatCmd := exec.CommandContext(ctx, juicefsPath, "format",
 		"--storage", "s3",
-		"--bucket", cfg.Bucket,
-		"--access-key", cfg.AccessKey,
-		"--secret-key", cfg.SecretKey,
-		"--endpoint", cfg.Endpoint,
-		"--region", cfg.Region,
-		"--meta", dbPath,
-		filepath.Join(cfg.KeyPrefix, "juicefs"),
+		"--bucket", bucketURL,
+		"--trash-days", "0",
+		fmt.Sprintf("sqlite3://%s", dbPath),
 		"juicefs")
 
-	if err := formatCmd.Run(); err != nil {
-		return fmt.Errorf("failed to format JuiceFS: %w", err)
+	// Set environment variables for authentication during format
+	formatCmd.Env = append(os.Environ(),
+		"AWS_ACCESS_KEY_ID="+cfg.AccessKey,
+		"AWS_SECRET_ACCESS_KEY="+cfg.SecretKey,
+	)
+
+	// Capture format command output
+	formatOutput, err := formatCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to format JuiceFS: %w\nOutput: %s", err, string(formatOutput))
 	}
+	fmt.Printf("JuiceFS format output: %s\n", string(formatOutput))
 
 	// Mount the filesystem
-	mountCmd := exec.CommandContext(ctx, "juicefs", "mount",
+	mountCmd := exec.CommandContext(ctx, juicefsPath, "mount",
 		"--storage", "s3",
-		"--bucket", cfg.Bucket,
-		"--access-key", cfg.AccessKey,
-		"--secret-key", cfg.SecretKey,
-		"--endpoint", cfg.Endpoint,
-		"--region", cfg.Region,
-		"--meta", dbPath,
-		filepath.Join(cfg.KeyPrefix, "juicefs"),
-		mountDir)
+		"--bucket", bucketURL,
+		fmt.Sprintf("sqlite3://%s", dbPath),
+		mountDir,
+	)
 
-	if err := mountCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start JuiceFS mount: %w", err)
+	// Set environment variables for authentication during mount
+	mountCmd.Env = append(os.Environ(),
+		"AWS_ACCESS_KEY_ID="+cfg.AccessKey,
+		"AWS_SECRET_ACCESS_KEY="+cfg.SecretKey,
+	)
+
+	// Run the mount command and capture output
+	mountOutput, err := mountCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to mount JuiceFS: %w\nOutput: %s", err, string(mountOutput))
 	}
+	fmt.Printf("JuiceFS mount output: %s\n", string(mountOutput))
 
-	// Set active directory path
+	// Give it a moment to start
+	time.Sleep(2 * time.Second)
+
+	// Verify it's running
+	statusCmd := exec.CommandContext(ctx, "juicefs", "status", fmt.Sprintf("sqlite3://%s", dbPath), mountDir)
+	statusOutput, err := statusCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to verify JuiceFS mount: %w\nOutput: %s", err, string(statusOutput))
+	}
+	fmt.Printf("JuiceFS mount status: %s\n", string(statusOutput))
+
+	// Set active directory path within the mount
 	j.activeDir = filepath.Join(mountDir, "active")
 
 	// Create active and checkpoints directories within the mount
@@ -109,7 +140,9 @@ func (j *JuiceFSComponent) CreateCheckpoint(ctx context.Context, id string) (str
 		return "", nil
 	}
 
-	checkpointDir := filepath.Join(filepath.Dir(j.activeDir), "checkpoints", id)
+	// Get the mount directory from the active directory path
+	mountDir := filepath.Dir(filepath.Dir(j.activeDir))
+	checkpointDir := filepath.Join(mountDir, "checkpoints", id)
 
 	// Move active to checkpoint
 	if err := os.Rename(j.activeDir, checkpointDir); err != nil {
@@ -126,7 +159,9 @@ func (j *JuiceFSComponent) CreateCheckpoint(ctx context.Context, id string) (str
 
 // RestoreToCheckpoint restores the filesystem to a previous checkpoint
 func (j *JuiceFSComponent) RestoreToCheckpoint(ctx context.Context, id string) error {
-	checkpointDir := filepath.Join(filepath.Dir(j.activeDir), "checkpoints", id)
+	// Get the mount directory from the active directory path
+	mountDir := filepath.Dir(filepath.Dir(j.activeDir))
+	checkpointDir := filepath.Join(mountDir, "checkpoints", id)
 
 	// Remove current active
 	if err := os.RemoveAll(j.activeDir); err != nil {
@@ -158,4 +193,28 @@ func (j *JuiceFSComponent) RestoreToCheckpoint(ctx context.Context, id string) e
 	}
 
 	return nil
+}
+
+// Status returns the current status of the JuiceFS component
+func (j *JuiceFSComponent) Status(ctx context.Context) map[string]interface{} {
+	status := make(map[string]interface{})
+
+	// Check if JuiceFS is mounted
+	mountDir := filepath.Join(j.config.EnvDir, "juicefs")
+	dbPath := filepath.Join(j.config.EnvDir, "db", "juicefs.sqlite")
+	cmd := exec.CommandContext(ctx, "juicefs", "status", fmt.Sprintf("sqlite3://%s", dbPath), mountDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		status["mounted"] = false
+		status["mount_error"] = err.Error()
+	} else {
+		status["mounted"] = true
+		status["mount_status"] = string(output)
+	}
+
+	// Add DB manager status if available
+	if j.dbManager != nil {
+		status["db_manager"] = j.dbManager.Status(ctx)
+	}
+
+	return status
 }

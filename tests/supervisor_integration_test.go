@@ -135,7 +135,7 @@ func TestLeaserIntegration(t *testing.T) {
 	}
 
 	leaserComponent := lib.NewLeaserComponent()
-	if err := leaserComponent.Setup(context.Background(), config); err != nil {
+	if err := leaserComponent.Setup(context.Background(), config, ""); err != nil {
 		t.Fatalf("LeaserComponent setup failed: %v", err)
 	}
 	defer leaserComponent.Cleanup(context.Background())

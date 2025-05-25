@@ -108,3 +108,31 @@ func (dm *DBManager) initializeDB(db *sql.DB) error {
 	}
 	return nil
 }
+
+// Status returns the current status of the DB manager
+func (d *DBManager) Status(ctx context.Context) map[string]interface{} {
+	status := make(map[string]interface{})
+
+	// Check if database file exists
+	if _, err := os.Stat(d.DBPath); err == nil {
+		status["db_exists"] = true
+	} else {
+		status["db_exists"] = false
+		status["db_error"] = err.Error()
+	}
+
+	// Check if litestream is running
+	if d.litestreamDB() != nil {
+		status["litestream_running"] = true
+		// Add replica statuses
+		replicas := make([]string, 0)
+		for _, replica := range d.litestreamDB().Replicas {
+			replicas = append(replicas, replica.Name())
+		}
+		status["replicas"] = replicas
+	} else {
+		status["litestream_running"] = false
+	}
+
+	return status
+}

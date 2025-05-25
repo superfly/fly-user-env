@@ -21,7 +21,7 @@ func NewLeaserComponent() *LeaserComponent {
 	}
 }
 
-func (l *LeaserComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
+func (l *LeaserComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, juicefsPath string) error {
 	leaser := lss3.NewLeaser()
 	leaser.Bucket = cfg.Bucket
 	leaser.Endpoint = cfg.Endpoint
@@ -76,4 +76,19 @@ func (l *LeaserComponent) ReleaseAllLeases(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// Status returns the current status of the leaser component
+func (l *LeaserComponent) Status(ctx context.Context) map[string]interface{} {
+	status := make(map[string]interface{})
+
+	if l.Leaser != nil {
+		status["leaser"] = map[string]interface{}{
+			"initialized": true,
+		}
+	} else {
+		status["leaser"] = nil
+	}
+
+	return status
 }

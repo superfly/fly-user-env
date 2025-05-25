@@ -19,9 +19,11 @@ import (
 // StackComponent represents a component in our stack that needs setup/cleanup
 type StackComponent interface {
 	// Setup initializes the component with the given config
-	Setup(ctx context.Context, cfg *ObjectStorageConfig) error
+	Setup(ctx context.Context, cfg *ObjectStorageConfig, juicefsPath string) error
 	// Cleanup performs any necessary cleanup when the component is no longer needed
 	Cleanup(ctx context.Context) error
+	// Status returns the status of the component
+	Status(ctx context.Context) map[string]interface{}
 }
 
 // CheckpointableComponent represents a component that supports checkpoint and restore operations
@@ -45,7 +47,7 @@ func NewDBManagerComponent(dataDir string) *DBManagerComponent {
 	return &DBManagerComponent{dataDir: dataDir}
 }
 
-func (d *DBManagerComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig) error {
+func (d *DBManagerComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, juicefsPath string) error {
 	log.Printf("DBManagerComponent.Setup: dataDir=%s", d.dataDir)
 	d.dbManager = NewDBManager(cfg, d.dataDir)
 	log.Printf("DBManagerComponent.Setup: DBPath=%s", d.dbManager.DBPath)
@@ -200,7 +202,7 @@ func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error 
 	// If no stacks specified, use all components
 	if len(cfg.Stacks) == 0 {
 		for _, component := range c.components {
-			if err := component.Setup(ctx, &cfg.Storage); err != nil {
+			if err := component.Setup(ctx, &cfg.Storage, "juicefs"); err != nil {
 				return fmt.Errorf("failed to setup component: %w", err)
 			}
 		}
@@ -214,7 +216,7 @@ func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error 
 			return fmt.Errorf("unknown stack component: %s", stackName)
 		}
 		log.Printf("Setting up component %s with dataDir: %s", stackName, c.dataDir)
-		if err := component.Setup(ctx, &cfg.Storage); err != nil {
+		if err := component.Setup(ctx, &cfg.Storage, "juicefs"); err != nil {
 			return fmt.Errorf("failed to setup component: %w", err)
 		}
 	}
@@ -553,4 +555,36 @@ func (c *Control) handleRestore(w http.ResponseWriter, r *http.Request) {
 		"status":        "success",
 		"checkpoint_id": req.CheckpointID,
 	})
+}
+
+// Cleanup performs cleanup of all components
+func (c *Control) Cleanup(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Clean up components in reverse order
+	for i := len(c.components) - 1; i >= 0; i-- {
+		component := c.components[i]
+		if err := component.Cleanup(ctx); err != nil {
+			return fmt.Errorf("failed to cleanup component: %w", err)
+		}
+	}
+	return nil
+}
+
+// Shutdown gracefully shuts down the control server
+func (c *Control) Shutdown(ctx context.Context) error {
+	// First cleanup all components
+	if err := c.Cleanup(ctx); err != nil {
+		return fmt.Errorf("failed to cleanup components: %w", err)
+	}
+
+	// Then stop the supervisor if it exists
+	if c.supervisor != nil {
+		if err := c.supervisor.StopProcess(); err != nil {
+			return fmt.Errorf("failed to stop supervisor: %w", err)
+		}
+	}
+
+	return nil
 }

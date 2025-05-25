@@ -1,3 +1,35 @@
-scripts/run-container.sh
+# Version control
 .git
+.gitignore
+
+# Build artifacts
+/tmp
+/bin
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test files
+*.test
+*.out
+
+# IDE files
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project specific
+/tmp
+*.db
+*.sqlite
+*.sqlite-journal
+
+scripts/run-container.sh
 vendor/litestream/.git 
