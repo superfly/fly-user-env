@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"supervisor/cmd"
-	"supervisor/lib"
+	"fly-user-env/cmd"
+	"fly-user-env/lib"
 )
 
 func main() {

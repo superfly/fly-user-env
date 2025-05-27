@@ -1,5 +1,5 @@
-// Package cmd implements the command-line interface for the supervisor service.
-// The supervisor manages long-running processes and provides HTTP proxying capabilities.
+// Package cmd implements the command-line interface for the fly-user-env service.
+// The service manages long-running processes and provides HTTP proxying capabilities.
 package cmd
 
 import (
@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"supervisor/lib"
+	"fly-user-env/lib"
 )
 
 // Cleanup represents a cleanup operation that can be deferred

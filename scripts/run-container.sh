@@ -17,18 +17,19 @@ for var in "${required_vars[@]}"; do
     fi
 done
 
-# Build the container if it doesn't exist
-docker build -t supervisor .
+# Build the Docker image
+docker build -t fly-user-env .
 
 # Stop and remove existing container if it exists
 docker stop fly-sprite-env 2>/dev/null || true
 docker rm fly-sprite-env 2>/dev/null || true
 
-# Run the container in the background
-docker run -d --name fly-sprite-env --privileged \
+# Run the container with the provided arguments
+docker run -it --rm \
+    --cap-add SYS_ADMIN \
+    --device /dev/fuse \
     -p 8080:8080 \
-    -e CONTROLLER_TOKEN="$CONTROLLER_TOKEN" \
-    supervisor "$@"
+    fly-user-env "$@"
 
 # Wait for the container to start
 sleep 2

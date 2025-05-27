@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"supervisor/lib"
+	"fly-user-env/lib"
 )
 
 // Helper function to get object storage configuration

@@ -1,4 +1,4 @@
-module supervisor
+module fly-user-env
 
 go 1.22
 

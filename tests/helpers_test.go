@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"supervisor/lib"
+	"fly-user-env/lib"
 )
 
 // SetupConfiguredControlServer creates a test directory, instantiates a Control with the specified stacks, starts an httptest.Server, and calls the config endpoint with the provided config.

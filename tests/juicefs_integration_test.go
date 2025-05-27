@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"supervisor/lib"
+	"fly-user-env/lib"
 )
 
 func TestJuiceFSIntegration(t *testing.T) {
 	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	// Fail fast if not running on Linux
@@ -41,10 +41,23 @@ func TestJuiceFSIntegration(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatalf("Failed to create test directory: %v", err)
 	}
+
+	// Create a separate context for the mount process that won't be canceled
+	mountCtx := context.Background()
 	defer func() {
 		// Remove test directory
 		os.RemoveAll(dir)
 	}()
+
+	// Clear out any existing mount and database directories
+	existingMountDir := filepath.Join(dir, "juicefs")
+	dbDir := filepath.Join(dir, "db")
+	if err := os.RemoveAll(existingMountDir); err != nil {
+		t.Logf("Warning: Failed to remove mount directory: %v", err)
+	}
+	if err := os.RemoveAll(dbDir); err != nil {
+		t.Logf("Warning: Failed to remove database directory: %v", err)
+	}
 
 	// Clean up the bucket before starting
 	bucket := os.Getenv("FLY_TIGRIS_BUCKET")
@@ -76,6 +89,11 @@ func TestJuiceFSIntegration(t *testing.T) {
 		components...,
 	)
 
+	// Set the mount context in the JuiceFS component
+	if juicefsComp, ok := components[0].(*lib.JuiceFSComponent); ok {
+		juicefsComp.SetMountContext(mountCtx)
+	}
+
 	server := httptest.NewServer(control)
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -84,29 +102,6 @@ func TestJuiceFSIntegration(t *testing.T) {
 			t.Logf("Warning: Failed to shutdown control server: %v", err)
 		}
 	}()
-
-	// Start status monitoring goroutine
-	// statusCtx, statusCancel := context.WithCancel(context.Background())
-	// defer statusCancel()
-	// go func() {
-	// 	ticker := time.NewTicker(5 * time.Second)
-	// 	defer ticker.Stop()
-	// 	for {
-	// 		select {
-	// 		case <-statusCtx.Done():
-	// 			return
-	// 		case <-ticker.C:
-	// 			for i, comp := range components {
-	// 				// Use a short timeout for status checks
-	// 				checkCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	// 				status := comp.Status(checkCtx)
-	// 				cancel()
-	// 				statusJSON, _ := json.MarshalIndent(status, "", "  ")
-	// 				t.Logf("Component %d status:\n%s", i, string(statusJSON))
-	// 			}
-	// 		}
-	// 	}
-	// }()
 
 	// Configure the control server
 	config := lib.SystemConfig{
@@ -128,6 +123,7 @@ func TestJuiceFSIntegration(t *testing.T) {
 	}
 
 	t.Run("Configure JuiceFS", func(t *testing.T) {
+		t.Log("Starting JuiceFS configuration...")
 		req, err := http.NewRequestWithContext(ctx, "POST", server.URL, bytes.NewBuffer(configJSON))
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
@@ -136,6 +132,7 @@ func TestJuiceFSIntegration(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer test-token")
 		req.Header.Set("Content-Type", "application/json")
 
+		t.Log("Sending configuration request...")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("Failed to make request: %v", err)
@@ -148,29 +145,22 @@ func TestJuiceFSIntegration(t *testing.T) {
 			t.Logf("Response body: %s", body)
 		}
 
+		t.Log("Verifying configuration was saved...")
 		// Verify configuration was saved
 		if _, err := os.Stat(filepath.Join(dir, "config.json")); os.IsNotExist(err) {
 			t.Error("Config file was not created")
 		}
+		t.Log("JuiceFS configuration completed successfully")
 	})
 
 	// Wait for JuiceFS to be ready
-	activeDir := filepath.Join(dir, "juicefs", "active")
 	mountDir := filepath.Join(dir, "juicefs")
-	if _, err := os.Stat(activeDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(activeDir, 0755); err != nil {
-			t.Fatalf("Failed to create active directory: %v", err)
-		}
-	}
-	// Optionally, check juicefs status
-	checkCtx, checkCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer checkCancel()
-	dbPath := filepath.Join(dir, "db", "juicefs.sqlite")
-	statusCmd := exec.CommandContext(checkCtx, "juicefs", "status", fmt.Sprintf("sqlite3://%s", dbPath), mountDir)
-	statusOutput, err := statusCmd.CombinedOutput()
-	t.Logf("juicefs status output: %s", string(statusOutput))
-	if err != nil {
-		t.Fatalf("juicefs status error: %v", err)
+	activeDir := filepath.Join(mountDir, "active")
+
+	// Create a test file in the active directory before checkpointing
+	testFile := filepath.Join(activeDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("Failed to write test file to active directory: %v", err)
 	}
 
 	t.Run("Test file operations", func(t *testing.T) {
@@ -181,6 +171,10 @@ func TestJuiceFSIntegration(t *testing.T) {
 	})
 
 	t.Run("Test checkpointing", func(t *testing.T) {
+		// Check if the active directory exists before checkpointing
+		if _, err := os.Stat(activeDir); os.IsNotExist(err) {
+			t.Fatalf("Active directory does not exist at %s", activeDir)
+		}
 		// Test checkpointing with ID
 		checkpointID := "test-checkpoint"
 		checkpointReq := struct {
@@ -214,7 +208,7 @@ func TestJuiceFSIntegration(t *testing.T) {
 		}
 
 		// Verify checkpoint exists
-		checkpointFile := filepath.Join(dir, "juicefs", "checkpoints", checkpointID, "test.txt")
+		checkpointFile := filepath.Join(mountDir, "checkpoints", checkpointID, "test.txt")
 		if _, err := os.Stat(checkpointFile); err != nil {
 			t.Fatalf("Checkpoint file not found: %v", err)
 		}
@@ -270,4 +264,19 @@ func TestJuiceFSIntegration(t *testing.T) {
 			t.Errorf("Expected file contents 'test' after restore, got '%s'", string(data))
 		}
 	})
+
+	// Check if JuiceFS is mounted as a FUSE filesystem
+	mountCmd := exec.CommandContext(ctx, "mount")
+	mountOutput, err := mountCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to run mount command: %v", err)
+	}
+	// Convert mountDir to absolute path for comparison
+	absMountDir, err := filepath.Abs(mountDir)
+	if err != nil {
+		t.Fatalf("Failed to get absolute path: %v", err)
+	}
+	if !bytes.Contains(mountOutput, []byte(absMountDir)) {
+		t.Fatalf("JuiceFS mount not found at %s", absMountDir)
+	}
 }

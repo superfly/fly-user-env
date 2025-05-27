@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"supervisor/lib"
+	"fly-user-env/lib"
 )
 
 func TestControlIntegration(t *testing.T) {
