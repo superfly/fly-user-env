@@ -1,61 +1,71 @@
 package lib
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 )
 
 // JuiceFSComponent implements StackComponent and CheckpointableComponent for JuiceFS file system management
 type JuiceFSComponent struct {
-	config    *ObjectStorageConfig
-	mountDir  string // Store the mount directory explicitly
-	activeDir string
-	dbManager *DBManager
-	mountCmd  *exec.Cmd
-	mountCtx  context.Context
+	config            *ObjectStorageConfig
+	basePath          string // Absolute base path for all JuiceFS operations
+	activeDir         string
+	dbManager         *DBManager
+	supervisor        *Supervisor
+	isReady           bool
+	shutdownRequested bool
+	mu                sync.RWMutex // protect isReady, mountCmd, and shutdownRequested access
+	stderrReader      io.ReadCloser
 }
 
 // NewJuiceFSComponent creates a new JuiceFS component
 func NewJuiceFSComponent() *JuiceFSComponent {
-	return &JuiceFSComponent{
-		mountCtx: context.Background(),
-	}
+	return &JuiceFSComponent{}
 }
 
 // SetMountContext sets the context to use for the mount process
 func (j *JuiceFSComponent) SetMountContext(ctx context.Context) {
-	j.mountCtx = ctx
+	// The supervisor handles the mount process, so no need to set mountCtx
 }
 
 // Setup initializes the JuiceFS component with the given config
 func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, juicefsPath string) error {
 	j.config = cfg
 
-	// Create mount directory (absolute path)
-	mountDir, err := filepath.Abs(filepath.Join(cfg.EnvDir, "juicefs"))
+	// Convert base path to absolute path
+	basePath, err := filepath.Abs(cfg.EnvDir)
 	if err != nil {
-		return fmt.Errorf("failed to get absolute path for mount directory: %w", err)
+		return fmt.Errorf("failed to get absolute path for base directory: %w", err)
 	}
+	j.basePath = basePath
+
+	// Create mount directory
+	mountDirStart := time.Now()
+	mountDir := filepath.Join(j.basePath, "juicefs")
 	if err := os.MkdirAll(mountDir, 0755); err != nil {
 		return fmt.Errorf("failed to create mount directory: %w", err)
 	}
-	j.mountDir = mountDir // Store the mount directory
+	log.Printf("Mount directory setup took %v", time.Since(mountDirStart))
 
-	// Create db directory (absolute path) - separate from mount
-	dbDir, err := filepath.Abs(filepath.Join(cfg.EnvDir, "db"))
-	if err != nil {
-		return fmt.Errorf("failed to get absolute path for db directory: %w", err)
-	}
+	// Create db directory - separate from mount
+	dbDirStart := time.Now()
+	dbDir := filepath.Join(j.basePath, "db")
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return fmt.Errorf("failed to create db directory: %w", err)
 	}
+	log.Printf("DB directory setup took %v", time.Since(dbDirStart))
 
-	// Initialize SQLite database for metadata (absolute path) - separate from mount
+	// Initialize SQLite database for metadata
+	dbInitStart := time.Now()
 	dbPath := filepath.Join(dbDir, "juicefs.sqlite")
 	j.dbManager = NewDBManager(cfg, dbDir)
 	j.dbManager.DBPath = dbPath
@@ -65,14 +75,13 @@ func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, 
 	if err := j.dbManager.StartReplication(); err != nil {
 		return fmt.Errorf("failed to start replication: %w", err)
 	}
-
-	// Compose bucket as endpoint/bucket
-	bucketURL := fmt.Sprintf("%s/%s", cfg.Endpoint, cfg.Bucket)
+	log.Printf("DB initialization and replication start took %v", time.Since(dbInitStart))
 
 	// Format the filesystem if it doesn't exist
+	formatStart := time.Now()
 	formatCmd := exec.CommandContext(ctx, juicefsPath, "format",
 		"--storage", "s3",
-		"--bucket", bucketURL,
+		"--bucket", cfg.Endpoint+"/"+cfg.Bucket,
 		"--trash-days", "0",
 		fmt.Sprintf("sqlite3://%s", dbPath),
 		"juicefs")
@@ -81,6 +90,8 @@ func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, 
 	formatCmd.Env = append(os.Environ(),
 		"AWS_ACCESS_KEY_ID="+cfg.AccessKey,
 		"AWS_SECRET_ACCESS_KEY="+cfg.SecretKey,
+		"AWS_ENDPOINT_URL="+cfg.Endpoint,
+		"AWS_REGION="+cfg.Region,
 	)
 
 	// Capture format command output
@@ -89,59 +100,111 @@ func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, 
 		return fmt.Errorf("failed to format JuiceFS: %w\nOutput: %s", err, string(formatOutput))
 	}
 	fmt.Printf("JuiceFS format output: %s\n", string(formatOutput))
+	log.Printf("JuiceFS format took %v", time.Since(formatStart))
 
-	// Log the mount command
-	log.Printf("Running mount command: %s", formatCmd.String())
-	mountCmd := exec.CommandContext(j.mountCtx, juicefsPath, "mount",
-		"--storage", "s3",
-		"--bucket", bucketURL,
-		fmt.Sprintf("sqlite3://%s", dbPath),
-		mountDir,
-	)
+	// Start the mount process
+	mountStart := time.Now()
 
-	// Set environment variables for authentication during mount
+	// Create mount command
+	mountCmd := exec.Command(juicefsPath, "mount", "--no-syslog", "--no-color",
+		fmt.Sprintf("sqlite3://%s", dbPath), mountDir)
 	mountCmd.Env = append(os.Environ(),
 		"AWS_ACCESS_KEY_ID="+cfg.AccessKey,
 		"AWS_SECRET_ACCESS_KEY="+cfg.SecretKey,
+		"AWS_ENDPOINT_URL="+cfg.Endpoint,
+		"AWS_REGION="+cfg.Region,
 	)
 
+	// Set up stdout/stderr before creating supervisor
 	mountCmd.Stdout = os.Stdout
-	mountCmd.Stderr = os.Stderr
-	if err := mountCmd.Start(); err != nil {
-		log.Printf("Mount command failed to start: %v", err)
-		return fmt.Errorf("failed to start JuiceFS mount: %w", err)
+	stderr, err := mountCmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
-	j.mountCmd = mountCmd
+	j.stderrReader = stderr
+
+	// Create supervisor for mount process
+	j.supervisor = NewSupervisorCmd(mountCmd, SupervisorConfig{
+		TimeoutStop: 90 * time.Second,
+	})
+
+	// Start the supervisor
+	if err := j.supervisor.StartProcess(); err != nil {
+		return fmt.Errorf("failed to start juicefs mount: %v", err)
+	}
+
+	// Create a channel to signal when the mount is ready
+	mountReady := make(chan error, 1)
+
+	// Monitor stderr for the ready message
 	go func() {
-		if err := mountCmd.Wait(); err != nil {
-			fmt.Printf("Mount process exited with error: %v\n", err)
-		} else {
-			fmt.Println("Mount process exited successfully.")
+		defer close(mountReady)
+		scanner := bufio.NewScanner(j.stderrReader)
+		expectedPath := mountDir
+		readyMsg := fmt.Sprintf("juicefs is ready at %s", expectedPath)
+		log.Printf("Waiting for ready message: %q", readyMsg)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("juicefs mount stderr: %s", line)
+			if strings.Contains(line, readyMsg) {
+				log.Printf("juicefs mount ready message detected")
+				mountReady <- nil
+				return
+			} else {
+				// Print raw text when no match
+				log.Printf("juicefs mount stderr (raw): %q", line)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			mountReady <- fmt.Errorf("error reading mount stderr: %v", err)
 		}
 	}()
 
-	// Give it a moment to start
-	time.Sleep(2 * time.Second)
-
-	// Verify it's running
-	fmt.Println("Running juicefs status check...")
-	statusCmd := exec.CommandContext(ctx, "juicefs", "status", fmt.Sprintf("sqlite3://%s", dbPath), mountDir)
-	statusOutput, err := statusCmd.CombinedOutput()
-	fmt.Printf("JuiceFS status command completed with err=%v\n", err)
-	if err != nil {
-		return fmt.Errorf("failed to verify JuiceFS mount: %w\nOutput: %s", err, string(statusOutput))
+	// Wait for mount to be ready or timeout
+	select {
+	case err := <-mountReady:
+		if err != nil {
+			j.mu.Lock()
+			if j.supervisor != nil {
+				j.supervisor.StopProcess()
+			}
+			j.mu.Unlock()
+			return fmt.Errorf("mount failed: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		j.mu.Lock()
+		if j.supervisor != nil {
+			j.supervisor.StopProcess()
+		}
+		j.mu.Unlock()
+		return fmt.Errorf("mount timed out after 60 seconds")
+	case <-ctx.Done():
+		j.mu.Lock()
+		if j.supervisor != nil {
+			j.supervisor.StopProcess()
+		}
+		j.mu.Unlock()
+		return ctx.Err()
 	}
-	fmt.Printf("JuiceFS mount status: %s\n", string(statusOutput))
+
+	// Mount is ready
+	j.mu.Lock()
+	j.isReady = true
+	j.mu.Unlock()
+
+	log.Printf("JuiceFS mount took %v", time.Since(mountStart))
 
 	// Create active and checkpoints directories within the mount
-	activeDir := filepath.Join(j.mountDir, "active")
-	checkpointsDir := filepath.Join(j.mountDir, "checkpoints")
+	dirsStart := time.Now()
+	activeDir := filepath.Join(mountDir, "active")
+	checkpointsDir := filepath.Join(mountDir, "checkpoints")
 	if err := os.MkdirAll(activeDir, 0755); err != nil {
 		return fmt.Errorf("failed to create active directory: %w", err)
 	}
 	if err := os.MkdirAll(checkpointsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create checkpoints directory: %w", err)
 	}
+	log.Printf("Creating active and checkpoints directories took %v", time.Since(dirsStart))
 
 	// Set active directory path within the mount
 	j.activeDir = activeDir
@@ -154,37 +217,45 @@ func (j *JuiceFSComponent) Setup(ctx context.Context, cfg *ObjectStorageConfig, 
 		log.Printf("Active directory exists at %s", j.activeDir)
 	}
 
-	// Check mount process status
-	log.Printf("Checking mount process status...")
-
-	// Log the state of the active and checkpoints directories after creation
-	log.Printf("Active directory created at %s", activeDir)
-	log.Printf("Checkpoints directory created at %s", checkpointsDir)
-
 	return nil
+}
+
+// Status returns the current status of the component
+func (j *JuiceFSComponent) Status(ctx context.Context) map[string]interface{} {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+
+	status := make(map[string]interface{})
+	status["ready"] = j.isReady
+	status["process_running"] = j.supervisor != nil
+	return status
 }
 
 // Cleanup performs cleanup when the component is no longer needed
 func (j *JuiceFSComponent) Cleanup(ctx context.Context) error {
+	j.mu.Lock()
+	j.shutdownRequested = true
+	j.mu.Unlock()
+
+	if j.supervisor != nil {
+		if err := j.supervisor.StopProcess(); err != nil {
+			log.Printf("Failed to stop mount process: %v", err)
+		}
+	}
+
+	// Clean up DB manager if it exists
 	if j.dbManager != nil {
 		if err := j.dbManager.StopReplication(); err != nil {
-			return fmt.Errorf("failed to stop replication: %w", err)
+			log.Printf("Failed to stop DB replication: %v", err)
 		}
 	}
-	if j.mountCmd != nil && j.mountCmd.Process != nil {
-		// Send SIGTERM to the mount process
-		if err := j.mountCmd.Process.Signal(os.Interrupt); err != nil {
-			// If SIGTERM fails, try SIGKILL
-			if err := j.mountCmd.Process.Kill(); err != nil {
-				return fmt.Errorf("failed to kill mount process: %w", err)
-			}
-		}
-		// Wait for the process to exit
-		if err := j.mountCmd.Wait(); err != nil {
-			fmt.Printf("Mount process exited with error during cleanup: %v\n", err)
-		}
-	}
+
 	return nil
+}
+
+// Shutdown performs a graceful shutdown of the component
+func (j *JuiceFSComponent) Shutdown(ctx context.Context) error {
+	return j.Cleanup(ctx)
 }
 
 // CreateCheckpoint creates a checkpoint by moving the active directory to a new checkpoint directory
@@ -197,8 +268,8 @@ func (j *JuiceFSComponent) CreateCheckpoint(ctx context.Context, id string) (str
 		return "", nil
 	}
 
-	// Use the stored mount directory
-	checkpointDir := filepath.Join(j.mountDir, "checkpoints", id)
+	// Use the base path for checkpoint directory
+	checkpointDir := filepath.Join(j.basePath, "juicefs", "checkpoints", id)
 
 	// Move active to checkpoint
 	if err := os.Rename(j.activeDir, checkpointDir); err != nil {
@@ -215,8 +286,8 @@ func (j *JuiceFSComponent) CreateCheckpoint(ctx context.Context, id string) (str
 
 // RestoreToCheckpoint restores the filesystem to a previous checkpoint
 func (j *JuiceFSComponent) RestoreToCheckpoint(ctx context.Context, id string) error {
-	// Use the stored mount directory
-	checkpointDir := filepath.Join(j.mountDir, "checkpoints", id)
+	// Use the base path for checkpoint directory
+	checkpointDir := filepath.Join(j.basePath, "juicefs", "checkpoints", id)
 
 	// Remove current active
 	if err := os.RemoveAll(j.activeDir); err != nil {
@@ -229,27 +300,4 @@ func (j *JuiceFSComponent) RestoreToCheckpoint(ctx context.Context, id string) e
 	}
 
 	return nil
-}
-
-// Status returns the current status of the JuiceFS component
-func (j *JuiceFSComponent) Status(ctx context.Context) map[string]interface{} {
-	status := make(map[string]interface{})
-
-	// Use the stored mount directory
-	dbPath := filepath.Join(j.config.EnvDir, "db", "juicefs.sqlite")
-	cmd := exec.CommandContext(ctx, "juicefs", "status", fmt.Sprintf("sqlite3://%s", dbPath), j.mountDir)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		status["mounted"] = false
-		status["mount_error"] = err.Error()
-	} else {
-		status["mounted"] = true
-		status["mount_status"] = string(output)
-	}
-
-	// Add DB manager status if available
-	if j.dbManager != nil {
-		status["db_manager"] = j.dbManager.Status(ctx)
-	}
-
-	return status
 }
