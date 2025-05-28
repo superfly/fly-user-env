@@ -5,6 +5,7 @@ package lib
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -56,6 +57,33 @@ func NewSupervisor(command []string, config SupervisorConfig) *Supervisor {
 	}
 }
 
+// NewSupervisorCmd creates a new supervisor for a pre-configured command.
+// This is useful when you need to set up environment variables or other command
+// configuration before supervision.
+func NewSupervisorCmd(cmd *exec.Cmd, config SupervisorConfig) *Supervisor {
+	// Set defaults if not specified
+	if config.TimeoutStop == 0 {
+		config.TimeoutStop = 90 * time.Second
+	}
+	if config.RestartDelay == 0 {
+		config.RestartDelay = time.Second
+	}
+
+	return &Supervisor{
+		command: cmd.Args,
+		config:  config,
+		process: struct {
+			sync.RWMutex
+			running bool
+			stopped bool
+			cmd     *exec.Cmd
+			pid     int
+		}{
+			cmd: cmd,
+		},
+	}
+}
+
 // IsRunning returns true if the supervised process is currently running.
 // This method is safe to call from multiple goroutines.
 func (s *Supervisor) IsRunning() bool {
@@ -88,29 +116,39 @@ func (s *Supervisor) StartProcess() error {
 		return fmt.Errorf("process is already running")
 	}
 
-	if len(s.command) == 0 {
+	if len(s.command) == 0 && s.process.cmd == nil {
 		return fmt.Errorf("empty command")
 	}
 
-	cmd := exec.Command(s.command[0], s.command[1:]...)
+	var cmd *exec.Cmd
+	if s.process.cmd != nil {
+		cmd = s.process.cmd
+	} else {
+		cmd = exec.Command(s.command[0], s.command[1:]...)
+	}
 
-	// Forward child process stdout/stderr directly to parent's stdout/stderr.
+	// Forward child process stdout to parent's stdout
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start process: %v", err)
 	}
 
+	s.process.running = true
+	s.process.stopped = false
+	s.process.cmd = cmd
+	s.process.pid = cmd.Process.Pid
+	log.Printf("Started process with PID %d: %v", s.process.pid, s.command)
+
 	go func() {
 		err := cmd.Wait()
 		s.process.Lock()
 		s.process.running = false
+		s.process.stopped = false
 		s.process.cmd = nil
 		s.process.pid = 0
-		// Only restart if the process wasn't stopped intentionally
 		shouldRestart := !s.process.stopped
-		s.process.stopped = false // Reset the flag
+		s.process.stopped = false
 		s.process.Unlock()
 		if err != nil {
 			log.Printf("Process exited with error: %v", err)
@@ -125,11 +163,6 @@ func (s *Supervisor) StartProcess() error {
 		}
 	}()
 
-	s.process.running = true
-	s.process.stopped = false
-	s.process.cmd = cmd
-	s.process.pid = cmd.Process.Pid
-	log.Printf("Started process with PID %d: %v", s.process.pid, s.command)
 	return nil
 }
 
@@ -183,6 +216,18 @@ func (s *Supervisor) StopProcess() error {
 		// Ensure process is cleaned up
 		if s.process.cmd.Process != nil {
 			s.process.cmd.Process.Release()
+		}
+
+		// Close any open pipes
+		if s.process.cmd.Stdout != nil {
+			if closer, ok := s.process.cmd.Stdout.(io.Closer); ok {
+				closer.Close()
+			}
+		}
+		if s.process.cmd.Stderr != nil {
+			if closer, ok := s.process.cmd.Stderr.(io.Closer); ok {
+				closer.Close()
+			}
 		}
 	}
 
