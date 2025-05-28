@@ -1,0 +1,390 @@
+# State Manager Specification
+
+## Process Management
+
+### Process Start
+1. When started without configuration:
+   - Server must start and listen on port 8080
+   - GET / must return 200 with empty status
+   - GET /config must return 404
+
+2. When started with configuration:
+   - Server must start and listen on port 8080
+   - GET / must return 200 with status including configured components
+   - GET /config must return 200 with current configuration
+
+### Process Supervision
+1. Process Start:
+   - Supervisor must execute the command with provided arguments
+   - Process stdout must be forwarded to supervisor's stdout
+   - Process stderr must be forwarded to supervisor's stderr
+   - Process PID must be recorded
+
+2. Process Monitoring:
+   - Supervisor must detect process exit
+   - On unexpected exit, supervisor must restart process after RestartDelay
+   - On intentional stop, supervisor must not restart process
+
+3. Process Stop:
+   - On SIGTERM, supervisor must send SIGTERM to process
+   - If process doesn't exit within TimeoutStop, supervisor must send SIGKILL
+   - Supervisor must wait for process exit before completing stop
+
+## Configuration Management
+
+### Initial Configuration
+1. Server Start:
+   - Server must create data directory if it doesn't exist
+   - Server must create tmp directory if it doesn't exist
+   - Server must initialize empty configuration state
+
+2. Configuration Application:
+   - POST /config must accept JSON configuration
+   - Configuration must be validated:
+     - All required fields must be present
+     - Storage configuration must be valid
+     - Stack components must be valid
+   - On valid configuration:
+     - Configuration must be saved to disk
+     - Server must initialize configured components
+     - Response must be 200
+   - On invalid configuration:
+     - Configuration must not be saved
+     - Response must be 400 with error details
+
+3. Configuration Persistence:
+   - Configuration must be saved to tmp/config.json
+   - Configuration must be loaded on server start
+   - Invalid configuration file must cause server to start unconfigured
+
+## State Management
+
+### Checkpointing
+1. Checkpoint Creation:
+   - POST /checkpoint must accept checkpoint ID
+   - System must:
+     - Create checkpoint directory
+     - Save database state
+     - Save object storage state
+     - Record checkpoint metadata
+   - Response must be 200 with checkpoint ID
+
+2. Checkpoint Restoration:
+   - POST /restore must accept checkpoint ID
+   - System must:
+     - Validate checkpoint exists
+     - Stop running processes
+     - Restore database state
+     - Restore object storage state
+     - Restart processes
+   - Response must be 200 on success, 404 if checkpoint not found
+
+### Database Management
+1. Database Operations:
+   - Database must be SQLite
+   - Database must be stored in data directory
+   - Replication must be configured if enabled
+   - Database must be accessible during normal operation
+
+2. Replication:
+   - Replication must be configured with S3 settings
+   - Replication must start on database initialization
+   - Replication must stop on cleanup
+
+## Object Storage
+
+### S3 Integration
+1. Storage Operations:
+   - System must connect to S3-compatible storage
+   - System must handle authentication
+   - System must respect configured endpoint
+   - System must use configured bucket
+
+2. State Backup:
+   - System must backup database state
+   - System must backup configuration
+   - System must handle backup failures
+
+## HTTP Interface
+
+### Endpoints
+1. GET /:
+   - Must return 200
+   - Must include:
+     - Process status
+     - Component status
+     - Configuration status
+
+2. GET /config:
+   - Must return 200 if configured
+   - Must return 404 if unconfigured
+   - Must return current configuration
+
+3. POST /config:
+   - Must return 400 if already configured
+   - Must return 400 if invalid configuration
+   - Must return 200 on successful configuration
+
+4. POST /checkpoint:
+   - Must return 400 if unconfigured
+   - Must return 400 if invalid checkpoint ID
+   - Must return 200 on successful checkpoint
+
+5. POST /restore:
+   - Must return 400 if unconfigured
+   - Must return 404 if checkpoint not found
+   - Must return 200 on successful restore
+
+6. POST /release-lease:
+   - Must return 400 if unconfigured
+   - Must return 200 on successful lease release
+
+## Verification Steps
+
+### Basic Functionality
+1. Start server without configuration:
+   ```bash
+   ./state-manager
+   curl http://localhost:8080/
+   curl http://localhost:8080/config
+   ```
+
+2. Apply configuration:
+   ```bash
+   curl -X POST http://localhost:8080/config -d @config.json
+   curl http://localhost:8080/config
+   ```
+
+3. Verify process management:
+   ```bash
+   # Start supervised process
+   curl http://localhost:8080/
+   # Kill process
+   kill <PID>
+   # Verify restart
+   curl http://localhost:8080/
+   ```
+
+### State Management
+1. Create checkpoint:
+   ```bash
+   curl -X POST http://localhost:8080/checkpoint -d '{"id":"test1"}'
+   ```
+
+2. Verify checkpoint:
+   ```bash
+   ls -l tmp/checkpoints/test1
+   ```
+
+3. Restore checkpoint:
+   ```bash
+   curl -X POST http://localhost:8080/restore -d '{"id":"test1"}'
+   ```
+
+### Error Handling
+1. Invalid configuration:
+   ```bash
+   curl -X POST http://localhost:8080/config -d '{"invalid":true}'
+   ```
+
+2. Invalid checkpoint:
+   ```bash
+   curl -X POST http://localhost:8080/restore -d '{"id":"nonexistent"}'
+   ```
+
+3. Process failure:
+   ```bash
+   # Start process that will fail
+   # Verify restart behavior
+   ```
+
+## Expected Behavior
+
+### Process Management
+- Process must start with provided command
+- Process must restart on unexpected exit
+- Process must stop on SIGTERM
+- Process must be killed on SIGKILL
+
+### Configuration
+- Server must start unconfigured
+- Configuration must be validated
+- Configuration must persist across restarts
+- Invalid configuration must be rejected
+
+### State Management
+- Checkpoints must be created successfully
+- Checkpoints must be restored successfully
+- Database must be replicated if configured
+- Object storage must be accessible
+
+### HTTP Interface
+- All endpoints must return correct status codes
+- All endpoints must return appropriate responses
+- Invalid requests must be rejected
+- Unconfigured operations must be rejected
+
+## Database Manager
+
+### Initialization
+1. Database Creation:
+   - Must create SQLite database in data directory
+   - Must create required tables if they don't exist
+   - Must set up replication if configured
+   - Must return error if database cannot be created
+
+2. Replication Setup:
+   - Must configure litestream replication
+   - Must use S3 settings from configuration
+   - Must start replication process
+   - Must handle replication errors
+
+### Operations
+1. Database Access:
+   - Must provide read/write access to database
+   - Must handle concurrent access
+   - Must maintain database consistency
+   - Must return errors for invalid operations
+
+2. Replication Management:
+   - Must maintain replication status
+   - Must handle replication failures
+   - Must provide replication status information
+   - Must stop replication on cleanup
+
+## JuiceFS Integration
+
+### Mount Management
+1. Mount Process:
+   - Must mount JuiceFS filesystem at configured path
+   - Must use credentials from configuration
+   - Must wait for mount completion before returning
+   - Must timeout after 60 seconds if mount doesn't complete
+   - Must handle mount failures
+
+2. Mount Configuration:
+   - Must use configured mount options
+   - Must set up cache directory
+   - Must configure metadata storage
+   - Must handle configuration errors
+
+### Operational Requirements
+1. Filesystem Availability:
+   - Must remain mounted after initial configuration
+   - Must be accessible at configured mount point
+   - Must maintain mount across server restarts
+   - Must handle network interruptions to S3 backend
+
+2. Data Consistency:
+   - Must maintain file consistency with S3 backend
+   - Must handle concurrent file access
+   - Must preserve file permissions
+   - Must maintain file metadata
+
+3. Performance Requirements:
+   - Must cache frequently accessed files
+   - Must handle large file operations
+   - Must maintain performance with multiple concurrent operations
+   - Must handle metadata operations efficiently
+
+4. Error Handling:
+   - Must handle S3 backend unavailability
+   - Must handle network interruptions
+   - Must handle disk space exhaustion
+   - Must handle permission errors
+   - Must log all filesystem errors
+
+5. Resource Management:
+   - Must manage cache size
+   - Must handle memory usage
+   - Must manage concurrent connections
+   - Must clean up temporary files
+
+### Filesystem Operations
+1. State Management:
+   - Must maintain filesystem state
+   - Must handle filesystem errors
+   - Must clean up on unmount
+
+2. Checkpoint Integration:
+   - Must include filesystem state in checkpoints
+   - Must restore filesystem state from checkpoints
+   - Must handle checkpoint failures
+   - Must maintain filesystem consistency
+
+### Verification Steps
+
+### Database Manager Verification
+1. Database Creation:
+   ```bash
+   # Verify database exists
+   ls -l data/database.sqlite
+   # Verify replication
+   ls -l data/database.sqlite-litestream
+   ```
+
+2. Database Operations:
+   ```bash
+   # Verify database access
+   sqlite3 data/database.sqlite "SELECT 1;"
+   # Verify replication status
+   curl http://localhost:8080/
+   ```
+
+### JuiceFS Verification
+1. Mount Verification:
+   ```bash
+   # Verify mount point
+   mount | grep juicefs
+   # Verify filesystem access
+   ls -l /path/to/mount
+   ```
+
+2. State Management:
+   ```bash
+   # Create test file
+   echo "test" > /path/to/mount/test.txt
+   # Create checkpoint
+   curl -X POST http://localhost:8080/checkpoint -d '{"id":"test2"}'
+   # Verify file in checkpoint
+   ls -l tmp/checkpoints/test2/mount/test.txt
+   ```
+
+3. Operational Verification:
+   ```bash
+   # Verify persistence across restarts
+   ./state-manager
+   ls -l /path/to/mount/test.txt
+   
+   # Verify concurrent access
+   for i in {1..10}; do
+     echo "test$i" > /path/to/mount/test$i.txt &
+   done
+   wait
+   ls -l /path/to/mount/test*.txt
+   
+   # Verify error handling
+   # Simulate S3 unavailability
+   # Verify filesystem behavior
+   ```
+
+## Expected Behavior
+
+### Database Manager
+- Database must be created on initialization
+- Replication must be configured if enabled
+- Database must be accessible during operation
+- Replication must maintain consistency
+- Database must be included in checkpoints
+
+### JuiceFS
+- Filesystem must mount successfully
+- Filesystem must be accessible
+- State must be included in checkpoints
+- State must be restored from checkpoints
+- Filesystem must unmount cleanly
+- Filesystem must maintain consistency
+- Filesystem must handle errors gracefully
+- Filesystem must manage resources efficiently
+- Filesystem must maintain performance under load
+- Filesystem must preserve data integrity 

@@ -1,117 +1,205 @@
-# Fly User Environment
+# State Manager
 
-A long-running service that runs in a Docker container and handles HTTP requests.
+A process management and state persistence system written in Go. It manages long-running processes, handles state persistence, and implements checkpointing and process recovery.
 
-## Features
+## Core Features
 
-- Runs as a service in a Docker container
-- Handles HTTP requests and proxies them to the target application
-- Provides an admin interface for configuration
-- Supports process supervision and automatic restarts
-- Manages file system state with JuiceFS
-- Handles database replication with Litestream
+### 1. Process Supervision
+- Process monitoring and management
+- Automatic process restart on failure
+- Graceful shutdown with configurable timeouts
+- Process status reporting
+
+### 2. State Management
+- System state checkpoint creation and restoration
+- SQLite database management with replication
+- S3-compatible object storage integration
+
+### 3. HTTP Control Interface
+- HTTP endpoints for system control
+- Initial server configuration
+- System status reporting
+
+## Architecture
+
+### Core Components
+
+1. **Supervisor**
+   - Process lifecycle management
+   - Process monitoring
+   - Signal handling
+   - Configurable restart delays
+
+2. **Control Interface**
+   - HTTP server
+   - Configuration management
+   - Status reporting
+   - Checkpoint operations
+
+3. **Database Manager**
+   - SQLite database operations
+   - Replication management
+   - State persistence
+
+4. **Object Storage Integration**
+   - S3-compatible storage operations
+   - Configurable endpoints
+   - State backup and restore
 
 ## Usage
 
+### Starting the System
 ```bash
-fly-user-env [flags] command [args...]
+./state-manager
 ```
 
-### Flags
+### Configuration
+The system uses a JSON configuration file with the following structure. The server can run in an unconfigured state and be configured later through the API:
 
-- `--listen`: Address to listen on (default: "0.0.0.0:8080")
-- `--target`: Address to proxy requests to (default: "127.0.0.1:3000")
-- `--token`: Authentication token for the admin interface (default: "test-token")
-
-### Examples
-
-Run a Python HTTP server:
-```bash
-fly-user-env --target 127.0.0.1:3000 python -m http.server 3000
+```json
+{
+  "storage": {
+    "bucket": "your-bucket",
+    "endpoint": "your-endpoint",
+    "access_key": "your-access-key",
+    "secret_key": "your-secret-key",
+    "region": "your-region",
+    "key_prefix": "your-prefix",
+    "env_dir": "your-env-dir"
+  },
+  "stacks": ["component1", "component2"]
+}
 ```
 
-Run a Node.js application:
-```bash
-fly-user-env --listen 0.0.0.0:9090 --target 127.0.0.1:3000 node server.js
-```
+### Configuration Flow
+1. The server can start in an unconfigured state
+2. Initial configuration can be applied through the API
+3. Once configured, the system will persist the configuration
+4. Configuration changes require server restart
 
-Run a custom application:
-```bash
-fly-user-env --target 127.0.0.1:3000 ./myapp --config config.yaml --debug
-```
+### Supervisor Configuration
+- `TimeoutStop`: Graceful shutdown timeout (default: 90s)
+- `RestartDelay`: Process restart delay (default: 1s)
 
-## Configuration
+## API Endpoints
 
-The service can be configured through the admin interface. Configuration options include:
+### Control Interface
+- `GET /`: System status
+- `GET /config`: Current configuration
+- `POST /config`: Initial configuration setup (only works on unconfigured server)
+- `POST /checkpoint`: Create system checkpoint
+- `POST /restore`: Restore from checkpoint
+- `POST /release-lease`: Release system lease
 
-- Object storage settings (S3-compatible)
-- Database replication settings
-- File system settings
-- Process management settings
+## Process Management
 
-## Building
+1. **Process Recovery**
+   - Automatic restart on process exit
+   - Configurable restart delays
+   - Process status monitoring
 
-### Local Build
+2. **State Persistence**
+   - Checkpoint creation
+   - Database replication
+   - Object storage backup
 
-```bash
-go build -o fly-user-env
-```
+3. **Shutdown Process**
+   - Configurable shutdown timeouts
+   - Signal handling
+   - Process termination
 
-### Docker Build
+## Monitoring
+- HTTP interface for system status
+- Process health monitoring
+- Database replication status
 
-```bash
-docker build -t fly-user-env .
-```
+## Security
 
-## Running with Docker
+1. **Authentication**
+   - Token-based API authentication
+   - Credential management
 
-```bash
-docker run -p 8080:8080 fly-user-env --target 127.0.0.1:3000 your-command
-```
+2. **Data Protection**
+   - Configuration file security
+   - API communication
 
-## Features
+## Operations
 
-- The service will start the specified command and monitor its output
-- If the command exits, the service will attempt to restart it
-- HTTP requests are proxied to the target application
-- The admin interface is available at `/admin` with the configured token
-- File system state is managed with JuiceFS
-- Database replication is handled with Litestream
+1. **Configuration**
+   - Environment variable usage
+   - Configuration backup
+   - Change documentation
+
+2. **Monitoring**
+   - Health checks
+   - Log monitoring
+   - Checkpoint tracking
+
+3. **Maintenance**
+   - Checkpoint cleanup
+   - Storage monitoring
+   - Credential updates
+
+## Error Handling
+
+The system implements error handling for:
+- Process failures
+- Configuration errors
+- Storage operations
+- Network operations
+
+## Limitations
+
+1. **Current Limitations**
+   - Database manager is not checkpointable
+   - S3-compatible storage only
+   - Single process supervision
+
+2. **Known Issues**
+   - Check documentation for current known issues
+   - Monitor GitHub issues for updates
 
 ## Development
 
 ### Prerequisites
-
 - Go 1.22 or later
 - Docker
 - FUSE support (for JuiceFS)
 - AWS CLI (for S3 operations)
 
-### Running Tests
+### Building
 
+#### Local Build
+```bash
+go build -o state-manager
+```
+
+#### Docker Build
+```bash
+docker build -t state-manager .
+```
+
+### Running Tests
 ```bash
 go test ./...
 ```
 
 ### Running Integration Tests
-
 ```bash
 go test -v ./tests/...
 ```
 
-## Behavior
+## Support
 
-- The service will start the specified command and monitor its output
-- If the command exits, the service will attempt to restart it
-- HTTP requests are proxied to the target application
-- The admin interface is available at `/admin` with the configured token
-- File system state is managed with JuiceFS
-- Database replication is handled with Litestream
+For issues and support:
+1. Check the documentation
+2. Review GitHub issues
+3. Contact the development team
 
-## Configuration
+## Contributing
 
-- `PORT` - Environment variable to set the server port (default: 8080)
-
-## API Endpoints
-
-- `GET /health` - Health check endpoint 
+Contributions are welcome:
+1. Fork the repository
+2. Create a feature branch
+3. Submit a pull request
+4. Follow the contribution guidelines 
