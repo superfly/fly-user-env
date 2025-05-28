@@ -243,11 +243,6 @@ func (c *Control) loadConfig() error {
 	// Store configs
 	c.config = &cfg
 
-	// Set up components
-	if err := c.setupComponents(context.Background(), &cfg); err != nil {
-		return fmt.Errorf("failed to set up components: %w", err)
-	}
-
 	return nil
 }
 

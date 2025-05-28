@@ -37,9 +37,18 @@ func TestJuiceFSIntegration(t *testing.T) {
 	}
 
 	// Create test directory
-	dir := filepath.Join("..", "tmp", "juicefs")
+	dir, err := filepath.Abs(filepath.Join("..", "tmp", "juicefs"))
+	if err != nil {
+		t.Fatalf("Failed to get absolute path for test directory: %v", err)
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatalf("Failed to create test directory: %v", err)
+	}
+
+	// Clean up any existing config file
+	configFile := filepath.Join(dir, "config.json")
+	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
+		t.Logf("Warning: Failed to remove existing config file: %v", err)
 	}
 
 	// Create a separate context for the mount process that won't be canceled
@@ -49,12 +58,8 @@ func TestJuiceFSIntegration(t *testing.T) {
 		os.RemoveAll(dir)
 	}()
 
-	// Clear out any existing mount and database directories
-	existingMountDir := filepath.Join(dir, "juicefs")
+	// Clear out database directory
 	dbDir := filepath.Join(dir, "db")
-	if err := os.RemoveAll(existingMountDir); err != nil {
-		t.Logf("Warning: Failed to remove mount directory: %v", err)
-	}
 	if err := os.RemoveAll(dbDir); err != nil {
 		t.Logf("Warning: Failed to remove database directory: %v", err)
 	}
@@ -156,6 +161,19 @@ func TestJuiceFSIntegration(t *testing.T) {
 	// Wait for JuiceFS to be ready
 	mountDir := filepath.Join(dir, "juicefs")
 	activeDir := filepath.Join(mountDir, "active")
+
+	// Wait for the mount to be ready by checking for the active directory
+	t.Run("Wait for mount", func(t *testing.T) {
+		t.Log("Waiting for JuiceFS mount to be ready...")
+		for i := 0; i < 60; i++ {
+			if _, err := os.Stat(activeDir); err == nil {
+				t.Log("Mount is ready")
+				return
+			}
+			time.Sleep(time.Second)
+		}
+		t.Fatal("Mount did not become ready within 60 seconds")
+	})
 
 	// Create a test file in the active directory before checkpointing
 	testFile := filepath.Join(activeDir, "test.txt")
