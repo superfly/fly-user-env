@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	lss3 "github.com/benbjohnson/litestream/s3"
 	// For types.NoSuchKey
 )
 
@@ -158,6 +156,13 @@ func DefaultObjectStorageConfig() ObjectStorageConfig {
 	}
 }
 
+// ControlHTTP represents a component that provides HTTP endpoints
+type ControlHTTP interface {
+	StackComponent
+	// ServeHTTP handles HTTP requests for this component
+	ServeHTTP(w http.ResponseWriter, r *http.Request)
+}
+
 // Control manages the control interface and object storage configuration
 // and provides methods for configuring and monitoring the system.
 type Control struct {
@@ -169,10 +174,9 @@ type Control struct {
 	controllerAddr string
 	token          string
 	supervisor     *Supervisor
-	dbManager      *DBManager
-	leaser         *lss3.Leaser
 	components     []StackComponent
 	err            error
+	mux            *http.ServeMux
 }
 
 // NewSystemConfigFromEnv creates a new SystemConfig from environment variables
@@ -228,7 +232,19 @@ func NewControlWithConfig(targetAddr, controllerAddr, token string, supervisor *
 		dataDir:        dataDir,
 		supervisor:     supervisor,
 		components:     components,
+		mux:            http.NewServeMux(),
 	}
+
+	// Set up initial routes (before config)
+	c.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			c.handleStatus(w, r)
+		} else if r.Method == http.MethodPost {
+			c.handleConfig(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 
 	// Check if we should wait for config
 	waitForConfig := os.Getenv("FLY_ENV_WAIT_FOR_CONFIG") != ""
@@ -248,6 +264,7 @@ func NewControlWithConfig(targetAddr, controllerAddr, token string, supervisor *
 			if err := c.setupComponents(context.Background(), envConfig); err != nil {
 				log.Printf("Failed to setup components from environment config: %v", err)
 			}
+			c.setupRoutes()
 			return c
 		}
 	}
@@ -255,130 +272,46 @@ func NewControlWithConfig(targetAddr, controllerAddr, token string, supervisor *
 	// Try to load existing config file
 	if err := c.loadConfig(); err != nil {
 		log.Printf("No existing config found: %v", err)
+	} else {
+		c.setupRoutes()
 	}
 
 	return c
 }
 
-// getAvailableComponents returns a map of available components by name
-func (c *Control) getAvailableComponents() map[string]StackComponent {
-	components := make(map[string]StackComponent)
-	for _, component := range c.components {
-		switch comp := component.(type) {
-		case *DBManagerComponent:
-			components["db"] = comp
-		case *LeaserComponent:
-			components["leaser"] = comp
-		case *JuiceFSComponent:
-			components["juicefs"] = comp
-		}
-	}
-	return components
-}
-
-func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error {
-	// Set up only the specified components
-	for _, stackName := range cfg.Stacks {
-		component, ok := c.getAvailableComponents()[stackName]
-		if !ok {
-			return fmt.Errorf("unknown stack component: %s", stackName)
-		}
-		log.Printf("Setting up component %s with dataDir: %s", stackName, c.dataDir)
-		if err := component.Setup(ctx, &cfg.Storage, "juicefs"); err != nil {
-			return fmt.Errorf("failed to setup component: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (c *Control) loadConfig() error {
+// setupRoutes configures the mux with routes based on the current configuration
+func (c *Control) setupRoutes() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Read config file
-	data, err := os.ReadFile(c.configPath)
-	if err != nil {
-		return fmt.Errorf("failed to read config file: %w", err)
+	// Create a new mux
+	c.mux = http.NewServeMux()
+
+	// Register component routes
+	for _, comp := range c.components {
+		if httpComp, ok := comp.(ControlHTTP); ok {
+			name := getComponentName(comp)
+			if name != "" {
+				c.mux.Handle("/stack/"+name+"/", http.StripPrefix("/stack/"+name, httpComp))
+			}
+		}
 	}
 
-	// Parse config
-	var cfg SystemConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
+	// Register other routes
+	c.mux.HandleFunc("/checkpoint", c.handleCheckpoint)
+	c.mux.HandleFunc("/restore", c.handleRestore)
+	c.mux.HandleFunc("/status", c.handleStatus)
 
-	// Store configs
-	c.config = &cfg
-
-	return nil
-}
-
-func (c *Control) saveConfig() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.config == nil {
-		return fmt.Errorf("no configuration to save")
-	}
-
-	// Create data directory if it doesn't exist
-	if err := os.MkdirAll(c.dataDir, 0755); err != nil {
-		return fmt.Errorf("failed to create data directory: %w", err)
-	}
-
-	// Marshal config
-	data, err := json.MarshalIndent(c.config, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-
-	// Write config file
-	if err := os.WriteFile(c.configPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Check for configuration error
-	if c.err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": c.err.Error()})
-		return
-	}
-
-	if r.Host != "fly-app-controller" {
-		http.Error(w, "Not found", http.StatusNotFound)
-		return
-	}
-
-	auth := r.Header.Get("Authorization")
-	expected := "Bearer " + c.token
-	if auth != expected {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	switch r.Method {
-	case http.MethodPost:
-		switch r.URL.Path {
-		case "/release-lease":
-			c.handleReleaseLease(w, r)
-		case "/checkpoint":
-			c.handleCheckpoint(w, r)
-		case "/restore":
-			c.handleRestore(w, r)
-		default:
+	// Handle root path based on method
+	c.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			c.handleStatus(w, r)
+		} else if r.Method == http.MethodPost {
 			c.handleConfig(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
-	case http.MethodGet:
-		c.handleStatus(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
+	})
 }
 
 func (c *Control) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -412,6 +345,9 @@ func (c *Control) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to set up components: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	// Set up routes after components are configured
+	c.setupRoutes()
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -465,62 +401,26 @@ func (c *Control) GetStorageConfig() *ObjectStorageConfig {
 	return &c.config.Storage
 }
 
-func (c *Control) GetLeaser() *lss3.Leaser {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.leaser
-}
-
 func (c *Control) handleReleaseLease(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var leaserComponent *LeaserComponent
 	for _, comp := range c.components {
 		if lc, ok := comp.(*LeaserComponent); ok {
-			leaserComponent = lc
-			break
+			if err := lc.ReleaseAllLeases(r.Context()); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
 		}
 	}
-	if leaserComponent == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "No active leaser component"})
-		return
-	}
-	if err := leaserComponent.ReleaseAllLeases(r.Context()); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
 
-func (c *Control) configureS3Leaser(ctx context.Context, config *ObjectStorageConfig) error {
-	leaser := lss3.NewLeaser()
-	leaser.Bucket = config.Bucket
-	leaser.Endpoint = config.Endpoint
-	leaser.AccessKeyID = config.AccessKey
-	leaser.SecretAccessKey = config.SecretKey
-	leaser.Region = config.Region
-	leaser.ForcePathStyle = true
-	leaser.Path = "leases/fly.lock"
-	leaser.Owner = os.Getenv("HOSTNAME") // Use hostname as lease owner
-	leaser.LeaseTimeout = 30 * time.Second
-
-	if err := leaser.Open(); err != nil {
-		return fmt.Errorf("failed to open leaser: %w", err)
-	}
-
-	c.leaser = leaser
-
-	// Start the process
-	if err := c.supervisor.StartProcess(); err != nil {
-		return fmt.Errorf("failed to start process: %v", err)
-	}
-
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]string{"error": "No active leaser component"})
 }
 
 // handleCheckpoint creates checkpoints for all checkpointable components and returns their status
@@ -676,4 +576,143 @@ func (c *Control) Shutdown(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (l *LeaserComponent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("LeaserComponent.ServeHTTP: path=%s, method=%s", r.URL.Path, r.Method)
+	switch r.Method {
+	case http.MethodPost:
+		if r.URL.Path == "/release" {
+			if err := l.ReleaseAllLeases(r.Context()); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "Not found", http.StatusNotFound)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// getComponentName returns the name of a component based on its type
+func getComponentName(comp StackComponent) string {
+	switch comp.(type) {
+	case *DBManagerComponent:
+		return "db"
+	case *LeaserComponent:
+		return "leaser"
+	case *JuiceFSComponent:
+		return "juicefs"
+	default:
+		return ""
+	}
+}
+
+func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error {
+	// Set up only the specified components
+	for _, stackName := range cfg.Stacks {
+		component, ok := c.getAvailableComponents()[stackName]
+		if !ok {
+			return fmt.Errorf("unknown stack component: %s", stackName)
+		}
+		log.Printf("Setting up component %s with dataDir: %s", stackName, c.dataDir)
+		if err := component.Setup(ctx, &cfg.Storage, "juicefs"); err != nil {
+			return fmt.Errorf("failed to setup component: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Control) getAvailableComponents() map[string]StackComponent {
+	components := make(map[string]StackComponent)
+	for _, component := range c.components {
+		switch comp := component.(type) {
+		case *DBManagerComponent:
+			components["db"] = comp
+		case *LeaserComponent:
+			components["leaser"] = comp
+		case *JuiceFSComponent:
+			components["juicefs"] = comp
+		}
+	}
+	return components
+}
+
+func (c *Control) loadConfig() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Read config file
+	data, err := os.ReadFile(c.configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Parse config
+	var cfg SystemConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Store configs
+	c.config = &cfg
+
+	return nil
+}
+
+func (c *Control) saveConfig() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.config == nil {
+		return fmt.Errorf("no configuration to save")
+	}
+
+	// Create data directory if it doesn't exist
+	if err := os.MkdirAll(c.dataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	// Marshal config
+	data, err := json.MarshalIndent(c.config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// Write config file
+	if err := os.WriteFile(c.configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check for configuration error
+	if c.err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": c.err.Error()})
+		return
+	}
+
+	if r.Host != "fly-app-controller" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	auth := r.Header.Get("Authorization")
+	expected := "Bearer " + c.token
+	if auth != expected {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Let the mux handle the request
+	c.mux.ServeHTTP(w, r)
 }
