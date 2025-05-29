@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 
@@ -25,6 +26,8 @@ func main() {
 			log.Printf("Error: %v", err)
 			os.Exit(1)
 		}
+	case "version":
+		fmt.Println(String())
 
 	default:
 		log.Printf("Unknown command: %s", args[0])

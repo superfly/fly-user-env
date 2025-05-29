@@ -25,8 +25,15 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application with CGO enabled
-RUN CGO_ENABLED=1 GOOS=linux go build -o fly-user-env
+# Build the application with CGO enabled and version information
+ARG VERSION=dev
+ARG BUILD_TIME
+ARG GIT_COMMIT
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags "-X main.Version=${VERSION} \
+              -X main.BuildTime=${BUILD_TIME} \
+              -X main.GitCommit=${GIT_COMMIT}" \
+    -o fly-user-env
 
 # Final stage
 FROM ubuntu:22.04
