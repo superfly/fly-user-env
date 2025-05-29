@@ -56,7 +56,7 @@ func (c *Cleanup) Errors() []error {
 	return c.errors
 }
 
-// RunSupervisor starts the supervisor service with the following responsibilities:
+// RunServer starts the server with the following responsibilities:
 // - Manages a long-running process specified by command-line arguments
 // - Provides an admin interface for configuration and status
 // - Proxies HTTP requests to the supervised process
@@ -70,7 +70,7 @@ func (c *Cleanup) Errors() []error {
 //   - CONTROLLER_TOKEN: Token for admin interface access
 //
 // Returns an error if the service fails to start, and a cleanup function that should be called on shutdown.
-func RunSupervisor() (error, *Cleanup, *lib.Supervisor) {
+func RunServer() (error, *Cleanup, *lib.Supervisor) {
 	cleanup := &Cleanup{}
 
 	listenAddr := flag.String("listen", "0.0.0.0:8080", "Address to listen on")
