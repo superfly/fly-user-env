@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -141,6 +142,22 @@ func DefaultControlConfig() ControlConfig {
 	}
 }
 
+// DefaultSystemConfig returns a new SystemConfig with default values
+func DefaultSystemConfig() SystemConfig {
+	return SystemConfig{
+		Storage: DefaultObjectStorageConfig(),
+		Stacks:  []string{"leaser", "juicefs"},
+	}
+}
+
+// DefaultObjectStorageConfig returns a new ObjectStorageConfig with default values
+func DefaultObjectStorageConfig() ObjectStorageConfig {
+	return ObjectStorageConfig{
+		Region:    "auto",
+		KeyPrefix: "/",
+	}
+}
+
 // Control manages the control interface and object storage configuration
 // and provides methods for configuring and monitoring the system.
 type Control struct {
@@ -155,6 +172,45 @@ type Control struct {
 	dbManager      *DBManager
 	leaser         *lss3.Leaser
 	components     []StackComponent
+	err            error
+}
+
+// NewSystemConfigFromEnv creates a new SystemConfig from environment variables
+func NewSystemConfigFromEnv() (*SystemConfig, error) {
+	// Check for required storage environment variables
+	bucket := os.Getenv("FLY_STORAGE_BUCKET")
+	endpoint := os.Getenv("FLY_STORAGE_ENDPOINT")
+	accessKey := os.Getenv("FLY_STORAGE_ACCESS_KEY")
+	secretKey := os.Getenv("FLY_STORAGE_SECRET_KEY")
+
+	// If any of the required storage variables are missing, return nil
+	if bucket == "" || endpoint == "" || accessKey == "" || secretKey == "" {
+		return nil, nil
+	}
+
+	// Start with default config
+	cfg := DefaultSystemConfig()
+
+	// Override with environment variables
+	cfg.Storage.Bucket = bucket
+	cfg.Storage.Endpoint = endpoint
+	cfg.Storage.AccessKey = accessKey
+	cfg.Storage.SecretKey = secretKey
+
+	// Optional storage configuration
+	if region := os.Getenv("FLY_STORAGE_REGION"); region != "" {
+		cfg.Storage.Region = region
+	}
+	if keyPrefix := os.Getenv("FLY_STORAGE_KEY_PREFIX"); keyPrefix != "" {
+		cfg.Storage.KeyPrefix = keyPrefix
+	}
+
+	// Get stacks from environment variable
+	if stacks := os.Getenv("FLY_STACKS"); stacks != "" {
+		cfg.Stacks = strings.Split(stacks, ",")
+	}
+
+	return &cfg, nil
 }
 
 // NewControl creates a new control instance
@@ -174,7 +230,29 @@ func NewControlWithConfig(targetAddr, controllerAddr, token string, supervisor *
 		components:     components,
 	}
 
-	// Try to load existing config
+	// Check if we should wait for config
+	waitForConfig := os.Getenv("FLY_ENV_WAIT_FOR_CONFIG") != ""
+
+	// Try to load config from environment first
+	if !waitForConfig {
+		if envConfig, err := NewSystemConfigFromEnv(); err == nil && envConfig != nil {
+			// Check if config file exists
+			if _, err := os.Stat(configPath); err == nil {
+				// Both environment variables and config file exist
+				c.config = nil
+				c.err = fmt.Errorf("configuration conflict: both environment variables and config file exist")
+				return c
+			}
+			c.config = envConfig
+			// Set up components with environment config
+			if err := c.setupComponents(context.Background(), envConfig); err != nil {
+				log.Printf("Failed to setup components from environment config: %v", err)
+			}
+			return c
+		}
+	}
+
+	// Try to load existing config file
 	if err := c.loadConfig(); err != nil {
 		log.Printf("No existing config found: %v", err)
 	}
@@ -199,16 +277,6 @@ func (c *Control) getAvailableComponents() map[string]StackComponent {
 }
 
 func (c *Control) setupComponents(ctx context.Context, cfg *SystemConfig) error {
-	// If no stacks specified, use all components
-	if len(cfg.Stacks) == 0 {
-		for _, component := range c.components {
-			if err := component.Setup(ctx, &cfg.Storage, "juicefs"); err != nil {
-				return fmt.Errorf("failed to setup component: %w", err)
-			}
-		}
-		return nil
-	}
-
 	// Set up only the specified components
 	for _, stackName := range cfg.Stacks {
 		component, ok := c.getAvailableComponents()[stackName]
@@ -274,6 +342,14 @@ func (c *Control) saveConfig() error {
 }
 
 func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check for configuration error
+	if c.err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": c.err.Error()})
+		return
+	}
+
 	if r.Host != "fly-app-controller" {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -306,7 +382,10 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Control) handleConfig(w http.ResponseWriter, r *http.Request) {
-	var cfgData SystemConfig
+	// Start with default config
+	cfgData := DefaultSystemConfig()
+
+	// Decode the request body into our config
 	if err := json.NewDecoder(r.Body).Decode(&cfgData); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
@@ -342,11 +421,17 @@ func (c *Control) handleStatus(w http.ResponseWriter, r *http.Request) {
 	defer c.mu.Unlock()
 
 	status := struct {
-		Configured bool `json:"configured"`
-		Running    bool `json:"running"`
+		Configured bool     `json:"configured"`
+		Running    bool     `json:"running"`
+		Stacks     []string `json:"stacks"`
 	}{
 		Configured: c.config != nil,
 		Running:    c.supervisor != nil && c.supervisor.IsRunning(),
+		Stacks:     nil, // Will be empty slice when not configured
+	}
+
+	if status.Configured {
+		status.Stacks = c.config.Stacks
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -356,13 +441,22 @@ func (c *Control) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (c *Control) Status() interface{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return struct {
-		Configured bool `json:"configured"`
-		Running    bool `json:"running"`
+
+	status := struct {
+		Configured bool     `json:"configured"`
+		Running    bool     `json:"running"`
+		Stacks     []string `json:"stacks"`
 	}{
 		Configured: c.config != nil,
 		Running:    c.supervisor != nil && c.supervisor.IsRunning(),
+		Stacks:     nil, // Will be empty slice when not configured
 	}
+
+	if status.Configured {
+		status.Stacks = c.config.Stacks
+	}
+
+	return status
 }
 
 func (c *Control) GetStorageConfig() *ObjectStorageConfig {

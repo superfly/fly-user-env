@@ -8,14 +8,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"fly-user-env/lib"
 )
 
-// Cleanup represents a cleanup operation that can be deferred
-type Cleanup struct {
+// ServerCleanup represents a cleanup operation that can be deferred
+type ServerCleanup struct {
 	mu     sync.Mutex
 	tasks  []func() error
 	done   bool
@@ -23,7 +25,7 @@ type Cleanup struct {
 }
 
 // Add adds a cleanup task to be executed
-func (c *Cleanup) Add(task func() error) {
+func (c *ServerCleanup) Add(task func() error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.done {
@@ -32,7 +34,7 @@ func (c *Cleanup) Add(task func() error) {
 }
 
 // Execute runs all cleanup tasks in reverse order
-func (c *Cleanup) Execute() {
+func (c *ServerCleanup) Execute() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.done {
@@ -50,7 +52,7 @@ func (c *Cleanup) Execute() {
 }
 
 // Errors returns any errors that occurred during cleanup
-func (c *Cleanup) Errors() []error {
+func (c *ServerCleanup) Errors() []error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.errors
@@ -69,9 +71,18 @@ func (c *Cleanup) Errors() []error {
 // Required environment variables:
 //   - CONTROLLER_TOKEN: Token for admin interface access
 //
+// Optional environment variables for configuration:
+//   - FLY_STORAGE_BUCKET: S3 bucket name
+//   - FLY_STORAGE_ENDPOINT: S3 endpoint URL
+//   - FLY_STORAGE_ACCESS_KEY: S3 access key
+//   - FLY_STORAGE_SECRET_KEY: S3 secret key
+//   - FLY_STORAGE_REGION: S3 region (optional)
+//   - FLY_STACKS: Comma-separated list of stack components to enable
+//   - FLY_ENV_WAIT_FOR_CONFIG: If set, wait for config via HTTP endpoint
+//
 // Returns an error if the service fails to start, and a cleanup function that should be called on shutdown.
-func RunServer() (error, *Cleanup, *lib.Supervisor) {
-	cleanup := &Cleanup{}
+func RunServer() (error, *ServerCleanup, *lib.Supervisor) {
+	cleanup := &ServerCleanup{}
 
 	listenAddr := flag.String("listen", "0.0.0.0:8080", "Address to listen on")
 	targetAddr := flag.String("target", "", "Address to proxy to")
@@ -98,8 +109,9 @@ func RunServer() (error, *Cleanup, *lib.Supervisor) {
 		TimeoutStop:  config.TimeoutStop,
 		RestartDelay: config.RestartDelay,
 	})
+
 	// Create control instance
-	control := lib.NewControl("localhost:8080", "test-token", "test-token", "tmp", supervisor)
+	control := lib.NewControl(*targetAddr, "fly-app-controller", token, "tmp", supervisor)
 
 	proxy, err := lib.New(*targetAddr, supervisor)
 	if err != nil {
@@ -140,4 +152,37 @@ func RunServer() (error, *Cleanup, *lib.Supervisor) {
 	}()
 
 	return nil, cleanup, supervisor
+}
+
+// RunServerAndWait starts the server and waits for shutdown signals.
+// This is the main entry point for the server command.
+func RunServerAndWait() error {
+	err, cleanup, supervisor := RunServer()
+	if err != nil {
+		return err
+	}
+
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		sig := <-sigChan
+		log.Printf("Received signal: %v, forwarding to supervised process", sig)
+		if supervisor != nil {
+			supervisor.ForwardSignal(sig)
+		}
+		if sig == syscall.SIGINT || sig == syscall.SIGTERM {
+			break
+		}
+	}
+
+	log.Printf("Shutting down...")
+	cleanup.Execute()
+	if errs := cleanup.Errors(); len(errs) > 0 {
+		log.Printf("Cleanup completed with %d errors", len(errs))
+		return fmt.Errorf("cleanup completed with %d errors", len(errs))
+	}
+	log.Printf("Cleanup completed successfully")
+	return nil
 }
