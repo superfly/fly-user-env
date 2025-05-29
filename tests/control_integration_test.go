@@ -477,3 +477,93 @@ func TestConfigFileOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestControlAuth(t *testing.T) {
+	// Setup control server as in TestControlIntegration
+	dir := filepath.Join("..", "tmp", "control-auth")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("Failed to create test directory: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	components := []lib.StackComponent{
+		lib.NewLeaserComponent(),
+		lib.NewDBManagerComponent(dir),
+	}
+	control := lib.NewControl(
+		"localhost:8080",
+		"localhost:8080",
+		"test-token",
+		dir,
+		nil,
+		components...,
+	)
+	server := httptest.NewServer(control)
+	defer server.Close()
+
+	t.Run("GET / without Authorization", func(t *testing.T) {
+		req, err := http.NewRequest("GET", server.URL, nil)
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "fly-app-controller"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status 401, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("POST / without Authorization", func(t *testing.T) {
+		req, err := http.NewRequest("POST", server.URL, nil)
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "fly-app-controller"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status 401, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("GET / with invalid token", func(t *testing.T) {
+		req, err := http.NewRequest("GET", server.URL, nil)
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "fly-app-controller"
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status 401, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("POST / with invalid token", func(t *testing.T) {
+		req, err := http.NewRequest("POST", server.URL, nil)
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		req.Host = "fly-app-controller"
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status 401, got %d", resp.StatusCode)
+		}
+	})
+}

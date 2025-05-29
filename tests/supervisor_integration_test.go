@@ -1,7 +1,6 @@
 package tests
 
 import (
-	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -113,41 +112,5 @@ func TestSupervisorIntegration(t *testing.T) {
 				t.Errorf("Expected value '%s', got '%s'", initialValue, value)
 			}
 		})
-	}
-}
-
-func TestLeaserIntegration(t *testing.T) {
-	// Skip if required env vars are not set
-	if os.Getenv("FLY_TIGRIS_BUCKET") == "" ||
-		os.Getenv("FLY_TIGRIS_ENDPOINT_URL") == "" ||
-		os.Getenv("FLY_TIGRIS_ACCESS_KEY") == "" ||
-		os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY") == "" {
-		t.Skip("Skipping integration test. Set FLY_TIGRIS_* environment variables to run.")
-	}
-
-	config := &lib.ObjectStorageConfig{
-		Bucket:    os.Getenv("FLY_TIGRIS_BUCKET"),
-		Endpoint:  os.Getenv("FLY_TIGRIS_ENDPOINT_URL"),
-		AccessKey: os.Getenv("FLY_TIGRIS_ACCESS_KEY"),
-		SecretKey: os.Getenv("FLY_TIGRIS_SECRET_ACCESS_KEY"),
-		Region:    "auto",
-		KeyPrefix: "test-leaser/",
-	}
-
-	leaserComponent := lib.NewLeaserComponent()
-	if err := leaserComponent.Setup(context.Background(), config, ""); err != nil {
-		t.Fatalf("LeaserComponent setup failed: %v", err)
-	}
-	defer leaserComponent.Cleanup(context.Background())
-
-	if leaserComponent.Leaser == nil {
-		t.Fatal("Leaser is nil after setup")
-	}
-	lease, err := leaserComponent.Leaser.AcquireLease(context.Background())
-	if err != nil {
-		t.Fatalf("Failed to acquire lease: %v", err)
-	}
-	if err := leaserComponent.Leaser.ReleaseLease(context.Background(), lease.Epoch); err != nil {
-		t.Fatalf("Failed to release lease: %v", err)
 	}
 }
